@@ -1,0 +1,53 @@
+# Dev overrides — applied automatically when running `docker compose up`
+# Production: docker compose -f docker-compose.yml up
+
+services:
+  frontend:
+    build:
+      target: deps
+    command: sh -c "npm install && npm run dev"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    read_only: false
+
+  api:
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ./backend:/app
+      - artifacts:/data/artifacts
+      - models:/data/models
+    read_only: false
+    deploy: {}
+
+  worker-default:
+    volumes:
+      - ./backend:/app
+      - artifacts:/data/artifacts
+      - models:/data/models
+    read_only: false
+    deploy: {}
+
+  worker-heavy:
+    volumes:
+      - ./backend:/app
+      - artifacts:/data/artifacts
+      - models:/data/models
+    read_only: false
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+
+  celery-beat:
+    read_only: false
+
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"

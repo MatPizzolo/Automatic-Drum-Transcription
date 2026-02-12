@@ -1,0 +1,58 @@
+# syntax=docker/dockerfile:1
+
+# ---- build stage: install deps with build tools ----
+FROM python:3.11-slim@sha256:0b23cfb7425d065008b778022a17b1551c82f8b4866ee5a7a200084b7e2eafbf AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libpq-dev libsndfile1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY requirements-api.txt requirements-worker.txt ./
+
+# Tier 0: Upgrade pip/setuptools/wheel for PEP 517 support
+# Tier 1: Pre-install build deps that madmom's setup.py imports at metadata time
+#         (madmom does `import numpy` and `from Cython.Build import cythonize` in setup.py)
+# Tier 2: Install all packages; --no-build-isolation tells pip to use the host
+#         Cython/numpy instead of creating an isolated venv (where they'd be missing)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip setuptools wheel && \
+    pip install Cython "numpy==1.26.4" && \
+    pip install --no-build-isolation --prefix=/install -r requirements-worker.txt
+
+# ---- runtime stage: slim image with audio/PDF tooling ----
+FROM python:3.11-slim@sha256:0b23cfb7425d065008b778022a17b1551c82f8b4866ee5a7a200084b7e2eafbf
+
+LABEL org.opencontainers.image.title="drumscribe-worker" \
+      org.opencontainers.image.description="DrumScribe Celery worker (Demucs, CNN inference)" \
+      org.opencontainers.image.version="0.1.0"
+
+# Runtime shared libs: libpq5 (asyncpg), libsndfile1 (soundfile), ffmpeg (demucs/librosa),
+# lilypond (PDF export), curl (healthcheck)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 ffmpeg libsndfile1 curl lilypond \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /install /usr/local
+
+RUN useradd -r -s /usr/sbin/nologin -u 1001 appuser
+
+WORKDIR /app
+COPY --chown=appuser:appuser . .
+
+RUN mkdir -p /data/artifacts /data/models /tmp/celery \
+    && chown -R appuser:appuser /data /tmp/celery
+
+# Make entrypoint executable
+RUN chmod +x /app/scripts/entrypoint-worker.sh /app/scripts/download_models.sh
+
+USER appuser
+
+# Explicit signal for graceful Celery shutdown
+STOPSIGNAL SIGTERM
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD celery -A app.worker inspect ping --timeout=5 || exit 1
+
+ENTRYPOINT ["/app/scripts/entrypoint-worker.sh"]
+CMD ["celery", "-A", "app.worker", "worker", "--loglevel=info"]

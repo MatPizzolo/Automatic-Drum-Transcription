@@ -1,0 +1,258 @@
+x-common-env: &common-env
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-drumscribe}:${POSTGRES_PASSWORD:-drumscribe}@postgres:5432/${POSTGRES_DB:-drumscribe}
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+
+x-storage-env: &storage-env
+  ARTIFACTS_DIR: /data/artifacts
+  MODEL_CACHE_DIR: /data/models
+  STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+  S3_BUCKET: ${S3_BUCKET:-}
+  S3_PREFIX: ${S3_PREFIX:-artifacts}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+
+x-model-env: &model-env
+  MODEL_URI: ${MODEL_URI:-}
+  MODEL_VERSION: ${MODEL_VERSION:-v1.0.0}
+  MODEL_SHA256: ${MODEL_SHA256:-}
+
+x-security: &security
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  read_only: true
+  tmpfs:
+    - /tmp
+
+services:
+
+  # ---- Frontend ----
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      - API_URL=http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    stop_grace_period: 15s
+    restart: unless-stopped
+    <<: *security
+    networks:
+      - drumscribe
+
+  # ---- Backend API ----
+  api:
+    build:
+      context: ./backend
+      dockerfile: infrastructure/Dockerfile.api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    env_file: .env
+    environment:
+      <<: [*common-env, *storage-env]
+    volumes:
+      - artifacts:/data/artifacts
+      - models:/data/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+    restart: unless-stopped
+    <<: *security
+    networks:
+      - drumscribe
+
+  # ---- Celery Worker: default queue ----
+  worker-default:
+    build:
+      context: ./backend
+      dockerfile: infrastructure/Dockerfile.worker
+    command: >
+      celery -A app.worker worker
+      --loglevel=info
+      --queues=default
+      --concurrency=4
+      --max-memory-per-child=512000
+      --hostname=default@%h
+    env_file: .env
+    environment:
+      <<: [*common-env, *storage-env, *model-env]
+      PDF_BACKEND: ${PDF_BACKEND:-lilypond}
+    volumes:
+      - artifacts:/data/artifacts
+      - models:/data/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    stop_grace_period: 120s
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.worker inspect ping --destination=default@$$HOSTNAME --timeout=5"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    restart: unless-stopped
+    <<: *security
+    networks:
+      - drumscribe
+
+  # ---- Celery Worker: heavy-compute queue (Demucs, CNN) ----
+  worker-heavy:
+    build:
+      context: ./backend
+      dockerfile: infrastructure/Dockerfile.worker
+    command: >
+      celery -A app.worker worker
+      --loglevel=info
+      --queues=heavy-compute
+      --concurrency=1
+      --max-memory-per-child=2048000
+      --hostname=heavy@%h
+    env_file: .env
+    environment:
+      <<: [*common-env, *storage-env, *model-env]
+      PDF_BACKEND: ${PDF_BACKEND:-lilypond}
+    volumes:
+      - artifacts:/data/artifacts
+      - models:/data/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    stop_grace_period: 300s
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.worker inspect ping --destination=heavy@$$HOSTNAME --timeout=5"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+        reservations:
+          cpus: "1.0"
+          memory: 2G
+    restart: unless-stopped
+    <<: *security
+    networks:
+      - drumscribe
+
+  # ---- Celery Beat: periodic tasks ----
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: infrastructure/Dockerfile.worker
+    command: >
+      celery -A app.worker beat
+      --loglevel=info
+      --pidfile=/tmp/celerybeat.pid
+      --schedule=/tmp/celerybeat-schedule
+    env_file: .env
+    environment:
+      <<: *common-env
+    depends_on:
+      redis:
+        condition: service_healthy
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/celerybeat.pid && kill -0 $$(cat /tmp/celerybeat.pid)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+    <<: *security
+    networks:
+      - drumscribe
+
+  # ---- PostgreSQL ----
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-drumscribe}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-drumscribe}
+      POSTGRES_DB: ${POSTGRES_DB:-drumscribe}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-drumscribe}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - drumscribe
+
+  # ---- Redis ----
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - drumscribe
+
+  # ---- Jaeger (tracing UI) ----
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"   # UI
+      - "4318:4318"                         # OTLP HTTP receiver
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    restart: unless-stopped
+    profiles:
+      - observability
+    networks:
+      - drumscribe
+
+volumes:
+  pgdata:
+  redisdata:
+  artifacts:
+  models:
+
+networks:
+  drumscribe:
+    driver: bridge

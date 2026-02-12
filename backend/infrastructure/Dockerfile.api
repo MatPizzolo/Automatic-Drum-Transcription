@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+
+# ---- build stage: install deps with build tools ----
+FROM python:3.11-slim@sha256:0b23cfb7425d065008b778022a17b1551c82f8b4866ee5a7a200084b7e2eafbf AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY requirements-api.txt ./requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --prefix=/install -r requirements.txt
+
+# ---- runtime stage: slim image, no compiler ----
+FROM python:3.11-slim@sha256:0b23cfb7425d065008b778022a17b1551c82f8b4866ee5a7a200084b7e2eafbf
+
+LABEL org.opencontainers.image.title="drumscribe-api" \
+      org.opencontainers.image.description="DrumScribe FastAPI backend" \
+      org.opencontainers.image.version="0.1.0"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /install /usr/local
+
+RUN useradd -r -s /usr/sbin/nologin -u 1001 appuser
+WORKDIR /app
+COPY --chown=appuser:appuser . .
+
+RUN mkdir -p /data/artifacts /data/models \
+    && chown -R appuser:appuser /data
+
+USER appuser
+EXPOSE 8000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/api/v1/health || exit 1
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
