@@ -73,11 +73,11 @@ export default function SheetMusicViewerInner({
   }
 
   return (
-    <div className="relative overflow-x-auto rounded-lg border border-border bg-white dark:bg-zinc-950">
+    <div className="relative overflow-x-auto rounded-lg border border-border bg-white p-6 shadow-sm">
       {isLoading && <Skeleton className="absolute inset-0 h-96 w-full" />}
       <div
         ref={containerRef}
-        className="min-h-[24rem] p-4"
+        className="min-h-[24rem] text-black"
         aria-label="Drum sheet music"
       />
     </div>

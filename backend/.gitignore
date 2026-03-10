@@ -8,6 +8,7 @@ venv/
 env/
 artifacts/
 model_cache/
+inference/
 *.egg-info/
 dist/
 build/

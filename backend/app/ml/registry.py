@@ -186,3 +186,4 @@ def preload_models() -> None:
         logger.info("models_preloaded")
     except Exception as e:
         logger.error("model_preload_failed", error=str(e))
+        raise SystemExit(1) from e

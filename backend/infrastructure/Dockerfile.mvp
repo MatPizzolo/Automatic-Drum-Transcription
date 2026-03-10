@@ -46,8 +46,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # ---- runtime stage: slim image with audio/PDF tooling ----
 FROM python:3.11-slim@sha256:0b23cfb7425d065008b778022a17b1551c82f8b4866ee5a7a200084b7e2eafbf
 
-LABEL org.opencontainers.image.title="drumscribe-worker" \
-      org.opencontainers.image.description="DrumScribe Celery worker (Demucs, CNN inference)" \
+LABEL org.opencontainers.image.title="drumscribe-api-mvp" \
+      org.opencontainers.image.description="DrumScribe FastAPI backend with embedded ML pipeline (MVP mode)" \
       org.opencontainers.image.version="0.1.0"
 
 # Runtime shared libs: libpq5 (asyncpg), libsndfile1 (soundfile), ffmpeg (demucs/librosa),
@@ -63,28 +63,23 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 RUN useradd -r -m -s /usr/sbin/nologin -u 1001 appuser
-
 WORKDIR /app
 COPY --chown=appuser:appuser . .
 
-# Optional: Copy local models if inference/ directory exists (local dev)
-# In production, models are downloaded at runtime via MODEL_URI
-RUN mkdir -p /data/artifacts /data/models /tmp/celery \
-    && chown -R appuser:appuser /data /tmp/celery \
-    && if [ -d "/app/inference" ]; then \
-         echo "Local models found in /app/inference — will be available as fallback"; \
-       fi
+RUN mkdir -p /data/artifacts /data/models /tmp/matplotlib \
+    && chown -R appuser:appuser /data /tmp/matplotlib
 
-# Make entrypoint executable
-RUN chmod +x /app/scripts/entrypoint-worker.sh /app/scripts/download_models.sh
+RUN chmod +x /app/scripts/entrypoint-api.sh
 
 USER appuser
 
-# Explicit signal for graceful Celery shutdown
-STOPSIGNAL SIGTERM
+# Set matplotlib config directory to writable location to avoid warnings
+ENV MPLCONFIGDIR=/tmp/matplotlib
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD celery -A app.worker inspect ping --timeout=5 || exit 1
+EXPOSE 8000
 
-ENTRYPOINT ["/app/scripts/entrypoint-worker.sh"]
-CMD ["celery", "-A", "app.worker", "worker", "--loglevel=info"]
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/api/health || exit 1
+
+ENTRYPOINT ["/app/scripts/entrypoint-api.sh"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

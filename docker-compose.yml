@@ -14,9 +14,10 @@ x-storage-env: &storage-env
   S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
 
 x-model-env: &model-env
-  MODEL_URI: ${MODEL_URI:-}
+  MODEL_URI: /app/inference/pretrained_models/annoteators/complete_network.h5
   MODEL_VERSION: ${MODEL_VERSION:-v1.0.0}
   MODEL_SHA256: ${MODEL_SHA256:-}
+  TORCH_HOME: /app/inference/demucs
 
 x-security: &security
   cap_drop:
@@ -67,6 +68,12 @@ services:
       redis:
         condition: service_healthy
     stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     deploy:
       resources:
         limits:
@@ -80,7 +87,52 @@ services:
     networks:
       - drumscribe
 
-  # ---- Celery Worker: default queue ----
+  # ---- Celery Worker: io queue (YouTube download, audio validation) ----
+  worker-io:
+    build:
+      context: ./backend
+      dockerfile: infrastructure/Dockerfile.worker
+    command: >
+      celery -A app.worker worker
+      --loglevel=info
+      --queues=io
+      --concurrency=8
+      --max-memory-per-child=256000
+      --hostname=io@%h
+    env_file: .env
+    environment:
+      <<: [*common-env, *storage-env, *model-env]
+      WORKER_MODE: "false"
+    volumes:
+      - artifacts:/data/artifacts
+      - models:/data/models
+      - ./inference:/app/inference
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.worker inspect ping --destination=io@$$HOSTNAME --timeout=5"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    restart: unless-stopped
+    <<: *security
+    networks:
+      - drumscribe
+
+  # ---- Celery Worker: default queue (transcription, export) ----
   worker-default:
     build:
       context: ./backend
@@ -99,6 +151,7 @@ services:
     volumes:
       - artifacts:/data/artifacts
       - models:/data/models
+      - ./inference:/app/inference
     depends_on:
       postgres:
         condition: service_healthy
@@ -143,6 +196,7 @@ services:
     volumes:
       - artifacts:/data/artifacts
       - models:/data/models
+      - ./inference:/app/inference
     depends_on:
       postgres:
         condition: service_healthy
@@ -180,7 +234,9 @@ services:
       --schedule=/tmp/celerybeat-schedule
     env_file: .env
     environment:
-      <<: *common-env
+      <<: [*common-env, *model-env]
+    volumes:
+      - ./inference:/app/inference
     depends_on:
       redis:
         condition: service_healthy

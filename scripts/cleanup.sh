@@ -3,13 +3,22 @@ set -euo pipefail
 
 # ============================================================================
 # cleanup.sh — Remove build artifacts, caches, and temporary files
-# Usage: ./scripts/cleanup.sh [--deep]
+# Usage: ./scripts/cleanup.sh [--deep] [--nuke]
 #   --deep: also remove node_modules, .venv, and Docker volumes
+#   --nuke: everything in --deep PLUS wipe the Docker builder cache and all
+#           project images (forces 100% fresh pip install on next build)
 # ============================================================================
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEEP=false
-[[ "${1:-}" == "--deep" ]] && DEEP=true
+NUKE=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --deep) DEEP=true ;;
+        --nuke) NUKE=true; DEEP=true ;;
+    esac
+done
 
 echo "==> Cleaning build artifacts and caches..."
 
@@ -30,6 +39,16 @@ rm -rf "$ROOT/frontend/.turbo"
 echo "==> Pruning dangling Docker images..."
 docker image prune -f 2>/dev/null || true
 
+if $NUKE; then
+    echo "==> NUKE: removing project images..."
+    docker images --format '{{.Repository}}:{{.Tag}}' \
+        | grep -E '^(automatic-drum-transcription|drumscribe)' \
+        | xargs docker rmi -f 2>/dev/null || true
+
+    echo "==> NUKE: pruning entire Docker builder cache..."
+    docker builder prune -af
+fi
+
 # Temp/artifacts (local dev only)
 rm -rf "$ROOT/artifacts"
 rm -rf "$ROOT/model_cache"
@@ -39,6 +58,10 @@ if $DEEP; then
     rm -rf "$ROOT/frontend/node_modules"
     rm -rf "$ROOT/backend/.venv"
     docker compose -f "$ROOT/docker-compose.yml" down -v 2>/dev/null || true
+fi
+
+if $NUKE; then
+    echo "==> NUKE complete — run './scripts/start.sh --nuke' for a fully fresh build."
 fi
 
 echo "==> Done."

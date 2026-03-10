@@ -9,7 +9,7 @@ interface UploadState {
 }
 
 const API_URL =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
 
 const LARGE_FILE_THRESHOLD = 5 * 1024 * 1024; // 5MB
 

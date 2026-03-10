@@ -28,18 +28,21 @@ async def health_check(db: AsyncSession = Depends(get_db)):
         health["checks"]["database"] = {"status": "down", "error": str(e)}
         logger.error("health_check_db_failed", error=str(e))
 
-    # Redis check
-    try:
-        import redis.asyncio as aioredis
+    # Redis check (skip in MVP mode when Celery is disabled)
+    if settings.USE_CELERY:
+        try:
+            import redis.asyncio as aioredis
 
-        r = aioredis.from_url(settings.REDIS_URL)
-        await r.ping()
-        await r.aclose()
-        health["checks"]["redis"] = {"status": "up"}
-    except Exception as e:
-        health["status"] = "degraded"
-        health["checks"]["redis"] = {"status": "down", "error": str(e)}
-        logger.error("health_check_redis_failed", error=str(e))
+            r = aioredis.from_url(settings.REDIS_URL)
+            await r.ping()
+            await r.aclose()
+            health["checks"]["redis"] = {"status": "up"}
+        except Exception as e:
+            health["status"] = "degraded"
+            health["checks"]["redis"] = {"status": "down", "error": str(e)}
+            logger.error("health_check_redis_failed", error=str(e))
+    else:
+        health["checks"]["redis"] = {"status": "skipped", "reason": "USE_CELERY=false"}
 
     # Model availability check (just checks if path/URI is configured)
     health["checks"]["model"] = {

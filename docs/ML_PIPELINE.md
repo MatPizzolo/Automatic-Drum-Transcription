@@ -13,9 +13,16 @@ Audio File / YouTube URL
         │
         ▼
 ┌─────────────────────────────────────────────────────────────────┐
+│  Stage 0: Ingestion (yt-dlp / file upload)                      │
+│  Download or validate uploaded audio                            │
+│  Queue: io │ concurrency: 8 │ I/O-bound                        │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ audio file
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
 │  Stage 1: Drum Separation (Demucs htdemucs)                     │
 │  Full mix → isolated drum track                                 │
-│  Queue: heavy-compute │ ~2-4 GB RAM │ GPU optional              │
+│  Queue: heavy-compute │ concurrency: 1 │ ~2–4 GB RAM            │
 └───────────────────────────┬─────────────────────────────────────┘
                             │ drums.wav
                             ▼
@@ -23,27 +30,39 @@ Audio File / YouTube URL
 │  Stage 2: Hit Prediction (Keras CNN)                            │
 │  BPM detection → onset detection → mel-spectrogram → classify   │
 │  6 classes: kick, snare, hihat, ride, tom, crash                │
-│  Queue: heavy-compute │ ~500 MB RAM                             │
+│  Queue: heavy-compute │ concurrency: 1 │ ~500 MB RAM            │
 └───────────────────────────┬─────────────────────────────────────┘
                             │ hits.json
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  Stage 3: Transcription (music21)                               │
 │  Quantize hits → build notation → export MusicXML + PDF         │
-│  Queue: default │ lightweight                                   │
+│  Queue: default │ concurrency: 4 │ lightweight                  │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                   sheet_music.musicxml
                   sheet_music.pdf
 ```
 
-Each stage runs as a separate **Celery task**, chained together:
+Each stage is a separate **Celery task** chained in `app/worker.py`:
 
 ```python
-ingest_audio → separate_drums → predict_hits → transcribe_and_export
+ingest_audio.s(job_id).set(queue="io")
+  | separate_drums.s().set(queue="heavy-compute")
+  | predict_hits.s().set(queue="heavy-compute")
+  | transcribe_and_export.s().set(queue="default")
 ```
 
-Stages 1-2 run on the `heavy-compute` queue (concurrency=1, 4 GB RAM limit). Stages 3 runs on the `default` queue (concurrency=4, lightweight).
+### Queue Assignment
+
+| Task | Queue | Worker | Reason |
+|------|-------|--------|--------|
+| `ingest_audio` | `io` | `worker-io` (concurrency 8) | Network-bound; parallel downloads safe |
+| `separate_drums` | `heavy-compute` | `worker-heavy` (concurrency 1) | Demucs requires up to 3.5 GB RAM alone |
+| `predict_hits` | `heavy-compute` | `worker-heavy` (concurrency 1) | Shares process with loaded Demucs model |
+| `transcribe_and_export` | `default` | `worker-default` (concurrency 4) | CPU-light; music21 + LilyPond only |
+| `cleanup_old_artifacts` | `default` | `worker-default` | Periodic I/O task via `celery-beat` |
+| `expire_stale_jobs` | `default` | `worker-default` | Periodic DB task via `celery-beat` (every 5 min) |
 
 ---
 
@@ -59,8 +78,8 @@ Stages 1-2 run on the `heavy-compute` queue (concurrency=1, 4 GB RAM limit). Sta
 | **Author** | Meta Research (Facebook AI) |
 | **Source** | [facebookresearch/demucs](https://github.com/facebookresearch/demucs) |
 | **Package** | `demucs==4.0.1` via PyPI |
-| **Weight download** | `torch.hub` → GitHub Releases (automatic on first call) |
-| **Weight cache** | `~/.cache/torch/hub/` inside the container |
+| **Weight download** | `demucs.pretrained.get_model("htdemucs")` → `torch.hub` → GitHub Releases (automatic on first call) |
+| **Weight cache** | `TORCH_HOME=/app/inference/demucs` → host bind-mount `./inference/demucs/` |
 | **Output stems** | drums, bass, other, vocals (index 0 = drums) |
 | **Peak RAM** | ~1.5 GB (1 min) to ~3.5 GB (5 min audio) |
 
@@ -223,44 +242,84 @@ PDF export supports three backends via the `PDF_BACKEND` env var:
 
 ## Model Management
 
-**File:** [`registry.py → ModelResolver`](../backend/app/ml/registry.py)
+The model lifecycle is split across two layers: **startup verification** (`app/core/model_manager.py`) and **runtime resolution** (`app/ml/registry.py`).
 
-### Resolution flow
+### Startup: `ModelManager` (entrypoint)
+
+`entrypoint-worker.sh` calls `python -m app.core.model_manager` before Celery starts. `ModelManager.setup_all_models()` runs two steps:
+
+**Step 1 — Demucs (critical):**
+Calls `demucs.pretrained.get_model("htdemucs")`. This triggers `torch.hub` to download weights to `TORCH_HOME=/app/inference/demucs` (a host bind-mount) if they are not already cached. If this step fails, the entrypoint exits with code 1 and the container does not start.
+
+**Step 2 — CNN verification (non-critical):**
+`ModelManager.verify_cnn_model()` checks `MODEL_URI`:
+
+| `MODEL_URI` type | Action | Container outcome |
+|-----------------|--------|-------------------|
+| Local path, file **exists** | Logs size, marks ready | ✓ starts |
+| Local path, file **missing** | Logs `cnn_model_missing` warning | **✓ starts** (graceful) |
+| `http://`, `https://`, `s3://` | Deferred — logs `cnn_model_remote` | ✓ starts |
+| Not set (`""`) | Logs `cnn_model_not_configured` warning | ✓ starts |
+
+Missing custom weights **never crash the container**. Workers start and are healthy; only `predict_hits` tasks will fail at runtime until weights are provided.
+
+### Runtime: `ModelResolver`
+
+**File:** [`app/ml/registry.py`](../backend/app/ml/registry.py)
+
+Called by `get_keras_model()` on the first job that reaches `predict_hits`.
 
 ```
-1. Check cache: /data/models/complete_network/{MODEL_VERSION}/complete_network.h5
+1. Check /data/models/complete_network/{MODEL_VERSION}/complete_network.h5
 2. Cache hit  → return path
 3. Cache miss → parse MODEL_URI scheme:
-     http(s):// → streaming download via httpx
+     http(s):// → httpx streaming download (timeout=300s)
      s3://      → boto3 download_file
      file://    → shutil.copy2
-4. Verify SHA256 integrity (if MODEL_SHA256 is set)
-5. Load into Keras → singleton cached for process lifetime
+4. Verify SHA256 integrity (if MODEL_SHA256 is set, deletes corrupt file on mismatch)
+5. Load into Keras → singleton cached in _keras_model for process lifetime
 ```
 
-### Lifecycle
+### Worker init signal
+
+When `WORKER_MODE=true`, the Celery `worker_init` signal calls `preload_models()`, which calls `get_keras_model()` immediately at startup. This warms the model into memory before any task arrives — eliminating the 30–90 s cold-start on the first `predict_hits` job.
+
+> `worker-io` sets `WORKER_MODE=false` (it never runs ML inference), so it skips model preloading entirely.
+
+### Lifecycle Summary
 
 | Event | What happens |
 |-------|-------------|
-| **Container start** | `entrypoint-worker.sh` runs `download_models.sh` — pre-caches both Demucs and CNN weights |
-| **Worker init** | `preload_models()` loads the Keras model into memory (called via Celery `worker_init` signal) |
-| **First job** | Models already warm — no cold-start delay |
-| **Version bump** | Change `MODEL_VERSION` env var → triggers fresh download on next startup |
+| **Container start** | `entrypoint-worker.sh` → `python -m app.core.model_manager` → Demucs weights cached to `./inference/demucs/` (bind-mount); CNN path verified or warned |
+| **Celery worker_init** | `preload_models()` → `ModelResolver.get_keras_model()` → CNN loaded into memory singleton |
+| **First `predict_hits` job** | CNN model already warm; no download delay |
+| **CNN file missing at startup** | Worker starts with warning; job fails at `predict_hits` with clear error |
+| **`MODEL_VERSION` bumped** | `ModelResolver` detects cache miss → fresh download on next startup |
 
-### Environment variables
+### Environment Variables
 
-| Variable | Example | Purpose |
+| Variable | Default | Purpose |
 |----------|---------|---------|
-| `MODEL_URI` | `https://bucket.s3.amazonaws.com/models/v1.0.0/complete_network.h5` | Where to download the CNN model |
-| `MODEL_VERSION` | `v1.0.0` | Cache key — change to force re-download |
-| `MODEL_CACHE_DIR` | `/data/models` | Local cache directory (Docker volume) |
-| `MODEL_SHA256` | `a1b2c3d4...` | Optional integrity check after download |
+| `MODEL_URI` | `inference/pretrained_models/annoteators/complete_network.h5` | CNN weights source (local path, HTTP, or S3) |
+| `MODEL_VERSION` | `v1.0.0` | Cache key in `/data/models/complete_network/{version}/` |
+| `MODEL_CACHE_DIR` | `/data/models` | Named Docker volume mount point |
+| `MODEL_SHA256` | `""` | Optional SHA256 for integrity check after download |
+| `TORCH_HOME` | `/app/inference/demucs` | `torch.hub` cache dir — bind-mounted to `./inference/demucs/` on host |
 
 ---
 
 ## Dependencies
 
-### ML Stack (worker only)
+### Two Requirements Files
+
+| File | Used By | Contents | Approx. Image Size |
+|------|---------|----------|--------------------|
+| `requirements-api.txt` | `Dockerfile.api` | FastAPI, SQLAlchemy, asyncpg, Redis, observability | ~400 MB |
+| `requirements-worker.txt` | `Dockerfile.worker` | All of API deps + full ML stack below | ~3 GB |
+
+The API never runs ML inference — it only dispatches jobs and serves results. This split keeps the API image lean and fast to build.
+
+### ML Stack (`requirements-worker.txt`)
 
 | Package | Version | Purpose |
 |---------|---------|---------|
@@ -273,23 +332,43 @@ PDF export supports three backends via the `PDF_BACKEND` env var:
 | `music21` | 9.3.0 | Sheet music generation and notation |
 | `pedalboard` | 0.9.16 | Audio effects (compression) |
 | `soundfile` | 0.13.1 | WAV file I/O |
-| `numpy` | 1.26.4 | Numerical operations |
+| `numpy` | 1.26.4 | Numerical operations (pinned — required by madmom at build time) |
 | `pandas` | 2.2.3 | Data manipulation |
 
-### Why two requirement files?
+### `madmom` Build Isolation
 
-- **`requirements-api.txt`** — FastAPI, SQLAlchemy, Redis, observability (~400 MB image)
-- **`requirements-worker.txt`** — inherits API deps + full ML stack (~3 GB image)
+`madmom==0.16.1` uses a legacy `setup.py` that imports `numpy` and `Cython` during pip's **metadata collection phase** — before the normal build-isolation sandbox can inject them. Installing it in a single `pip install -r requirements-worker.txt` call fails.
 
-The API server never runs ML inference — it only dispatches jobs and serves results. This split keeps the API image small and fast to deploy.
+`Dockerfile.worker` resolves this with a four-tier install sequence (see [Docker Build Architecture](DEVOPS.md#4-docker-build-architecture)):
+
+```
+Tier 0: Upgrade pip/setuptools/wheel
+Tier 1: Pre-seed numpy==1.26.4 + Cython>=3 into system site-packages
+Tier 2: Install everything except madmom (full build isolation, clean dep tree)
+Tier 3: Install madmom --no-build-isolation (sees Tier 1 numpy/Cython)
+```
+
+This keeps `celery[redis]` and its transitive dependencies (including `packaging`, required by `kombu`) resolved cleanly in Tier 2, while satisfying `madmom`'s unusual build requirements in Tier 3.
 
 ---
 
 ## Architecture Decisions
 
+### Why three queues instead of two?
+
+The original two-queue design (`default` + `heavy-compute`) mixed YouTube downloads with transcription tasks on `default`. Under burst traffic, long yt-dlp downloads would block available slots, starving MusicXML/PDF export jobs. The `io` queue dedicates high-concurrency (8) workers to network I/O, keeping `default` exclusively for CPU work and `heavy-compute` for ML inference. Each queue is independently scalable.
+
 ### Why Demucs before CNN?
 
 The CNN was trained on **isolated drum tracks**, not full mixes. Running it on a full mix produces poor results because vocals, bass, and guitars create false onsets. Demucs separation is essential preprocessing.
+
+### Why `./inference` as a bind-mount for Demucs weights?
+
+Named Docker volumes are opaque — you can't inspect, pre-populate, or version-control their contents directly. Mounting `./inference` as a host directory means Demucs weights are:
+- Visible and manageable on the host filesystem
+- Preserved across `docker compose down -v`
+- Shareable between worker replicas on the same host without duplication
+- Easy to pre-populate by copying weights into `./inference/demucs/` before first run
 
 ### Why 8820 samples per frame?
 
@@ -305,4 +384,8 @@ madmom uses a recurrent neural network trained specifically for beat tracking, w
 
 ### Why singleton model loading?
 
-Loading Demucs (~300 MB) and the Keras CNN (~15 MB) on every job would add 30-90 seconds of overhead. Both models are loaded once at worker startup and cached as module-level globals, so subsequent jobs start instantly.
+Loading Demucs (~300 MB) and the Keras CNN (~15 MB) on every job would add 30–90 seconds of overhead. Both models are loaded once at worker startup and cached as module-level globals (`_demucs_model`, `_keras_model`), so subsequent jobs start instantly.
+
+### Why does a missing CNN not crash the container?
+
+During development, custom weights (`complete_network.h5`) may not be committed to the repository or may be stored externally. A hard failure on missing weights would prevent any worker from starting — blocking development of unrelated features (e.g., ingestion, transcription formatting). `ModelManager` separates Demucs (infrastructure-critical) from the CNN (feature-critical) so each can fail independently at the appropriate severity level.

@@ -27,5 +27,8 @@ yt-dlp==2024.12.23
 # S3 Storage Backend
 boto3>=1.34.0
 
+# System monitoring
+psutil==6.1.1
+
 # Celery instrumentation
 opentelemetry-instrumentation-celery==0.48b0

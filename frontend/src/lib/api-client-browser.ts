@@ -1,7 +1,7 @@
 import type { Job, ApiError } from "@/types/api";
 
 const API_URL =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
 
 const FETCH_TIMEOUT_MS = 10_000;
 
@@ -65,8 +65,7 @@ export async function deleteJob(id: string): Promise<void> {
 
 export async function checkHealth(): Promise<boolean> {
   try {
-    const baseUrl = API_URL.replace(/\/api\/v1$/, "");
-    const res = await fetch(`${baseUrl}/health`, {
+    const res = await fetch(`${API_URL}/health`, {
       signal: AbortSignal.timeout(5000),
     });
     return res.ok;

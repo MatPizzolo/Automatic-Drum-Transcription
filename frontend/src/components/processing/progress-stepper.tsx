@@ -89,6 +89,8 @@ export function ProgressStepper({ currentStatus }: ProgressStepperProps) {
             >
               {isFailed && isActive ? (
                 <XCircle className="h-5 w-5 text-destructive" />
+              ) : isCompleted ? (
+                <CheckCircle2 className="h-5 w-5" />
               ) : (
                 <Icon className="h-5 w-5" />
               )}

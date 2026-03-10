@@ -8,6 +8,15 @@ from app.core.config import settings
 
 def setup_logging() -> None:
     """Configure structured JSON logging via structlog."""
+    # Use ConsoleRenderer for development, JSONRenderer for production
+    use_json = settings.ENVIRONMENT == "production"
+    
+    if use_json:
+        renderer = structlog.processors.JSONRenderer()
+    else:
+        # Development mode: human-readable console output with colors
+        renderer = structlog.dev.ConsoleRenderer(colors=True)
+    
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
@@ -19,7 +28,7 @@ def setup_logging() -> None:
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
             structlog.processors.UnicodeDecoder(),
-            structlog.processors.JSONRenderer(),
+            renderer,
         ],
         wrapper_class=structlog.stdlib.BoundLogger,
         context_class=dict,
@@ -34,13 +43,27 @@ def setup_logging() -> None:
 
     handler = logging.StreamHandler(sys.stdout)
     handler.setLevel(log_level)
-    formatter = structlog.stdlib.ProcessorFormatter(
-        processor=structlog.processors.JSONRenderer(),
-    )
+    
+    # Use plain formatter for stdlib logs to avoid double-encoding
+    if use_json:
+        formatter = structlog.stdlib.ProcessorFormatter(
+            processor=structlog.processors.JSONRenderer(),
+        )
+    else:
+        formatter = structlog.stdlib.ProcessorFormatter(
+            processor=structlog.dev.ConsoleRenderer(colors=True),
+        )
     handler.setFormatter(formatter)
 
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
+
+    # Reduce noise from verbose third-party libraries
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+    logging.getLogger("multipart").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:

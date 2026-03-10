@@ -16,8 +16,9 @@ model_cache/
 dist/
 build/
 infrastructure/
-*.h5
-*.pt
-*.pth
-*.onnx
-*.savedmodel/
+# Block model files in root, but allow inference/ directory for local dev models
+/*.h5
+/*.pt
+/*.pth
+/*.onnx
+/*.savedmodel/

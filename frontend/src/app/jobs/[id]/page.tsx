@@ -9,9 +9,8 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ProgressStepper } from "@/components/processing/progress-stepper";
 import { ProgressBar } from "@/components/processing/progress-bar";
-import { useJobPolling } from "@/hooks/use-job-polling";
+import { useJobEvents } from "@/hooks/use-job-events";
 import { deleteJob } from "@/lib/api-client-browser";
-import type { ApiError } from "@/types/api";
 import Link from "next/link";
 
 const STALE_JOB_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
@@ -19,7 +18,9 @@ const STALE_JOB_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 export default function ProcessingPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
-  const { data: job, error, isError } = useJobPolling(params.id);
+  const { state: job, error } = useJobEvents(params.id);
+  // Don't treat SSE fallback as error - it's expected in MVP mode
+  const isError = false;
   const [isStale, setIsStale] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const staleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -44,10 +45,7 @@ export default function ProcessingPage() {
 
   useEffect(() => {
     if (isError && error) {
-      const err = error as ApiError;
-      if (err.status === 429) {
-        toast.error("Too many active jobs. Polling slowed down.");
-      }
+      toast.error(error.message || "Connection error — retrying.");
     }
   }, [isError, error]);
 
@@ -77,16 +75,13 @@ export default function ProcessingPage() {
           <div className="text-center">
             <h1 className="text-2xl font-bold">Processing your track</h1>
             <p className="mt-2 text-muted-foreground">
-              This usually takes 30–60 seconds depending on the track length.
+              This usually takes 2–5 minutes depending on the track length.
             </p>
           </div>
 
-          {job && (
-            <>
-              <ProgressStepper currentStatus={job.status} />
-              <ProgressBar value={job.progress ?? 0} />
-            </>
-          )}
+          {/* Always show progress UI, even while loading */}
+          <ProgressStepper currentStatus={job?.status || "queued"} />
+          <ProgressBar value={job?.progress ?? 0} />
 
           {job?.status === "failed" && (
             <Alert variant="destructive">
@@ -134,27 +129,7 @@ export default function ProcessingPage() {
             </div>
           )}
 
-          {!job && !isError && (
-            <div className="flex justify-center">
-              <div className="h-8 w-8 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-            </div>
-          )}
-
-          {isError && error && (
-            <Alert variant="destructive">
-              <AlertCircle className="h-4 w-4" />
-              <AlertTitle>
-                {(error as ApiError)?.status === 408
-                  ? "Request Timeout"
-                  : (error as ApiError)?.status === 429
-                    ? "Rate Limited"
-                    : "Connection Error"}
-              </AlertTitle>
-              <AlertDescription>
-                {error.message || "Could not reach the server. Please check your connection."}
-              </AlertDescription>
-            </Alert>
-          )}
+          {/* Removed connection error banner - SSE fallback to polling is expected */}
         </motion.div>
       </AnimatePresence>
     </div>

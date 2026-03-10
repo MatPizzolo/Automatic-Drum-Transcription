@@ -1,0 +1,122 @@
+x-common-env: &common-env
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-drumscribe}:${POSTGRES_PASSWORD:-drumscribe}@postgres:5432/${POSTGRES_DB:-drumscribe}
+
+x-storage-env: &storage-env
+  ARTIFACTS_DIR: /data/artifacts
+  MODEL_CACHE_DIR: /data/models
+  STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+  S3_BUCKET: ${S3_BUCKET:-}
+  S3_PREFIX: ${S3_PREFIX:-artifacts}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+
+x-model-env: &model-env
+  MODEL_URI: /app/inference/pretrained_models/annoteators/complete_network.h5
+  MODEL_VERSION: ${MODEL_VERSION:-v1.0.0}
+  MODEL_SHA256: ${MODEL_SHA256:-}
+  TORCH_HOME: /app/inference/demucs
+
+x-security: &security
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  read_only: true
+  tmpfs:
+    - /tmp
+
+services:
+
+  # ---- Frontend ----
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api}
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      - API_URL=http://api:8000/api
+    depends_on:
+      api:
+        condition: service_healthy
+    stop_grace_period: 15s
+    restart: unless-stopped
+    networks:
+      - drumscribe
+
+  # ---- Backend API (MVP Mode: runs ML pipeline in-process) ----
+  api:
+    build:
+      context: ./backend
+      dockerfile: infrastructure/Dockerfile.mvp
+    ports:
+      - "${API_PORT:-8000}:8000"
+    env_file: .env
+    environment:
+      <<: [*common-env, *storage-env, *model-env]
+      USE_CELERY: "false"
+      PDF_BACKEND: ${PDF_BACKEND:-lilypond}
+      NUMBA_CACHE_DIR: /tmp/numba_cache
+    volumes:
+      - artifacts:/data/artifacts
+      - models:/data/models
+      - ./inference:/app/inference
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+        reservations:
+          cpus: "1.0"
+          memory: 1G
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /tmp/numba_cache
+    networks:
+      - drumscribe
+
+  # ---- PostgreSQL ----
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-drumscribe}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-drumscribe}
+      POSTGRES_DB: ${POSTGRES_DB:-drumscribe}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-drumscribe}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - drumscribe
+
+volumes:
+  pgdata:
+  artifacts:
+  models:
+
+networks:
+  drumscribe:
+    driver: bridge

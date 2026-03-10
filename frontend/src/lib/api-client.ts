@@ -1,6 +1,6 @@
 import type { CreateJobResponse, Job, JobResult, ApiError } from "@/types/api";
 
-const API_URL = process.env.API_URL || "http://localhost:8000/api/v1";
+const API_URL = process.env.API_URL || "http://localhost:8000/api";
 
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {

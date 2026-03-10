@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJobStatus } from "@/lib/api-client-browser";
 import type { ApiError } from "@/types/api";
 
-const DEFAULT_POLL_MS = 2000;
+const DEFAULT_POLL_MS = 5000;
 const BACKOFF_POLL_MS = 10_000;
 
 export function useJobPolling(jobId: string) {

@@ -8,8 +8,10 @@ This module replicates the core logic from AnNOTEator's inference pipeline:
 Adapted for production use with singleton model loading and structured outputs.
 """
 
+import gc
 import multiprocessing
 import os
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +40,7 @@ MEL_POWER = 2.0
 # Demucs model singleton (loaded once per worker process)
 _demucs_model = None
 _demucs_device = None
+_demucs_lock = threading.Lock()
 # AnNOTEator order: SD, HH, KD, RC, TT, CC
 
 
@@ -53,14 +56,15 @@ def run_drum_separation(input_path: str, output_path: str) -> None:
 
     global _demucs_model, _demucs_device
 
-    if _demucs_model is None:
-        logger.info("demucs_loading_model")
-        _demucs_model = pretrained.get_model("htdemucs")
-        _demucs_model.eval()
-        _demucs_device = "cuda" if torch.cuda.is_available() else "cpu"
-        _demucs_model.to(_demucs_device)
-    else:
-        logger.info("demucs_using_cached_model")
+    with _demucs_lock:
+        if _demucs_model is None:
+            logger.info("demucs_loading_model")
+            _demucs_model = pretrained.get_model(settings.DEMUCS_MODEL_NAME)
+            _demucs_model.eval()
+            _demucs_device = "cuda" if torch.cuda.is_available() else "cpu"
+            _demucs_model.to(_demucs_device)
+        else:
+            logger.info("demucs_using_cached_model")
 
     model = _demucs_model
     device = _demucs_device
@@ -98,6 +102,12 @@ def run_drum_separation(input_path: str, output_path: str) -> None:
     drums = sources[0].cpu().numpy()
     drums_mono = librosa.to_mono(drums)
 
+    # Free all 4 stem tensors immediately — only drums are needed downstream
+    del sources, drums
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     # Save atomically — write to temp file then rename to prevent corrupt artifacts on crash
     import tempfile
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", dir=str(Path(output_path).parent))
@@ -113,7 +123,7 @@ def run_drum_separation(input_path: str, output_path: str) -> None:
     logger.info("demucs_complete", output=output_path, samplerate=model.samplerate)
 
     # Memory cleanup (don't delete model — it's cached as singleton)
-    del sources, wav
+    del wav
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -209,28 +219,45 @@ def run_prediction(
             "hits": [],
         }
 
-    # --- Mel-Spectrogram Feature Extraction ---
-    mel_specs = []
-    for clip in clips:
-        mel = librosa.feature.melspectrogram(
-            y=clip, sr=sr, n_fft=MEL_N_FFT, hop_length=MEL_HOP_LENGTH,
-            n_mels=MEL_N_MELS, fmax=MEL_FMAX, power=MEL_POWER,
-        )
-        mel_specs.append(mel)
+    # --- Mel-Spectrogram Feature Extraction + Mini-batch CNN Inference ---
+    # Process in batches of CNN_BATCH_SIZE to keep peak RAM bounded regardless
+    # of track length (avoids OOM on dense long-form audio).
+    CNN_BATCH_SIZE = 256
 
-    # Free raw audio and clips — no longer needed after mel extraction
-    del drum_track, clips, o_env, onset_frames, onset_samples
-
-    X = np.array(mel_specs)
-    del mel_specs
-    X = X.reshape(X.shape[0], X.shape[1], X.shape[2], 1)
-
-    # --- CNN Prediction ---
     from app.ml.registry import get_model_resolver
     resolver = get_model_resolver()
-    model = resolver.get_keras_model()
+    try:
+        model = resolver.get_keras_model()
+    except (FileNotFoundError, Exception) as e:
+        logger.error(
+            "cnn_model_unavailable",
+            error=str(e),
+            message="CNN model not found. Ensure complete_network.h5 is in ./inference/pretrained_models/annoteators/"
+        )
+        raise RuntimeError(
+            "Hit classification model not available. "
+            "Place complete_network.h5 in ./inference/pretrained_models/annoteators/ and restart workers."
+        ) from e
 
-    pred_raw = model.predict(X, verbose=0)
+    all_preds: list = []
+    for batch_start in range(0, len(clips), CNN_BATCH_SIZE):
+        batch_clips = clips[batch_start : batch_start + CNN_BATCH_SIZE]
+        batch_mels = []
+        for clip in batch_clips:
+            mel = librosa.feature.melspectrogram(
+                y=clip, sr=sr, n_fft=MEL_N_FFT, hop_length=MEL_HOP_LENGTH,
+                n_mels=MEL_N_MELS, fmax=MEL_FMAX, power=MEL_POWER,
+            )
+            batch_mels.append(mel)
+        X_batch = np.array(batch_mels).reshape(len(batch_mels), MEL_N_MELS, -1, 1)
+        all_preds.append(model.predict(X_batch, verbose=0))
+        del batch_mels, X_batch
+
+    # Free raw audio and clips — no longer needed
+    del drum_track, clips, o_env, onset_frames, onset_samples
+
+    pred_raw = np.concatenate(all_preds, axis=0)
+    del all_preds
     pred_rounded = np.round(pred_raw)
 
     # AnNOTEator logic: if all zeros, pick argmax
@@ -297,6 +324,12 @@ def _detect_bpm(drum_track: np.ndarray, sr: int) -> tuple[float, bool]:
 
     # Try madmom first
     try:
+        # Python 3.11 compatibility fix for madmom
+        import collections
+        import collections.abc
+        if not hasattr(collections, 'MutableSequence'):
+            collections.MutableSequence = collections.abc.MutableSequence
+        
         import madmom
         proc = madmom.features.tempo.TempoEstimationProcessor(fps=100)
         act = madmom.features.beats.RNNBeatProcessor()(drum_track)

@@ -23,3 +23,9 @@ model_cache/
 *.pth
 *.onnx
 *.savedmodel/
+
+# Inference directory - contains large model files
+inference/demucs/
+inference/pretrained_models/annoteators/*.h5
+inference/pretrained_models/annoteators/*.pt
+inference/pretrained_models/annoteators/*.pth

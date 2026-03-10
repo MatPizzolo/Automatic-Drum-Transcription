@@ -26,9 +26,9 @@ LABEL org.opencontainers.image.title="drumscribe-frontend" \
 RUN addgroup -g 1001 -S appgroup && adduser -S appuser -u 1001
 WORKDIR /app
 
-COPY --from=builder --chown=appuser:appgroup /app/public ./public
 COPY --from=builder --chown=appuser:appgroup /app/.next/standalone ./
 COPY --from=builder --chown=appuser:appgroup /app/.next/static ./.next/static
+RUN mkdir -p ./public
 
 USER appuser
 EXPOSE 3000

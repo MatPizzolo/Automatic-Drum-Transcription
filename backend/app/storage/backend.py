@@ -6,6 +6,7 @@ via the `STORAGE_BACKEND` env var ("local" or "s3").
 """
 
 import abc
+import asyncio
 import io
 import os
 import shutil
@@ -23,8 +24,16 @@ class StorageBackend(abc.ABC):
 
     @abc.abstractmethod
     def save_file(self, job_id: str, filename: str, data: bytes) -> str:
-        """Save file data, return the stored path/key."""
+        """Save file data synchronously, return the stored path/key."""
         ...
+
+    async def save_file_async(self, job_id: str, filename: str, data: bytes) -> str:
+        """Save file data without blocking the event loop.
+
+        Default implementation delegates to the sync method via asyncio.to_thread.
+        Subclasses may override with a fully async implementation.
+        """
+        return await asyncio.to_thread(self.save_file, job_id, filename, data)
 
     @abc.abstractmethod
     def read_file(self, path: str) -> bytes:
@@ -80,6 +89,19 @@ class LocalStorageBackend(StorageBackend):
         dest = Path(self.get_file_path(job_id, filename))
         dest.write_bytes(data)
         logger.info("file_saved", job_id=job_id, filename=filename, size=len(data))
+        return str(dest)
+
+    async def save_file_async(self, job_id: str, filename: str, data: bytes) -> str:
+        """Non-blocking write using aiofiles — avoids stalling the event loop."""
+        try:
+            import aiofiles
+        except ImportError:
+            return await asyncio.to_thread(self.save_file, job_id, filename, data)
+
+        dest = Path(self.get_file_path(job_id, filename))
+        async with aiofiles.open(dest, "wb") as f:
+            await f.write(data)
+        logger.info("file_saved_async", job_id=job_id, filename=filename, size=len(data))
         return str(dest)
 
     def read_file(self, path: str) -> bytes:
@@ -167,9 +189,25 @@ class S3StorageBackend(StorageBackend):
         if Path(path).exists():
             return Path(path).read_bytes()
 
-        # Parse S3 key from path and download
-        logger.warning("s3_read_fallback_local", path=path)
-        return Path(path).read_bytes()
+        # Derive S3 key from the local cache path and download from S3
+        try:
+            rel = Path(path).relative_to(self._local_cache)
+            key = f"{self.prefix}/{'/'.join(rel.parts)}"
+        except ValueError:
+            raise FileNotFoundError(
+                f"Path '{path}' is outside the local cache and cannot be mapped to an S3 key"
+            )
+
+        logger.info("s3_cache_miss_downloading", path=path, key=key)
+        obj = self._s3.get_object(Bucket=self.bucket, Key=key)
+        data = obj["Body"].read()
+
+        # Populate local cache for subsequent reads
+        local_path = Path(path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(data)
+
+        return data
 
     def file_exists(self, path: str) -> bool:
         # Check local cache first (fast path)
@@ -225,6 +263,21 @@ class S3StorageBackend(StorageBackend):
         except Exception as e:
             logger.warning("s3_list_error", job_id=job_id, error=str(e))
         return files
+
+    def generate_presigned_url(self, job_id: str, filename: str, expires: int = 900) -> Optional[str]:
+        """Generate a time-limited pre-signed S3 URL for direct client download."""
+        key = self._s3_key(job_id, filename)
+        try:
+            url = self._s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": self.bucket, "Key": key},
+                ExpiresIn=expires,
+            )
+            logger.info("presigned_url_generated", job_id=job_id, key=key, expires=expires)
+            return url
+        except Exception as e:
+            logger.warning("presigned_url_failed", job_id=job_id, key=key, error=str(e))
+            return None
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, model_validator
 from typing import List
 
 
@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "DrumScribe API"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = False
+    ENVIRONMENT: str = "development"  # "development", "staging", or "production"
 
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://drumscribe:drumscribe@localhost:5432/drumscribe"
@@ -43,10 +44,11 @@ class Settings(BaseSettings):
     S3_ENDPOINT_URL: str = ""  # For MinIO or localstack
 
     # Model
-    MODEL_URI: str = "inference/pretrained_models/annoteators/complete_network.h5"
+    MODEL_URI: str = ""  # Set to http://, https://, s3://, or file:// path
     MODEL_VERSION: str = "v1.0.0"
     MODEL_CACHE_DIR: str = "./model_cache"
     MODEL_SHA256: str = ""  # Optional SHA256 checksum for integrity verification
+    DEMUCS_MODEL_NAME: str = "htdemucs"  # Override to use htdemucs_ft, mdx_extra, etc.
 
     # PDF Export — "lilypond", "musescore", or "none"
     PDF_BACKEND: str = "lilypond"
@@ -82,6 +84,7 @@ class Settings(BaseSettings):
     LOW_CONFIDENCE_THRESHOLD: float = 0.5
 
     # Celery
+    USE_CELERY: bool = True
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/1"
 
@@ -90,6 +93,16 @@ class Settings(BaseSettings):
         "env_file_encoding": "utf-8",
         "case_sensitive": True,
     }
+
+    @model_validator(mode="after")
+    def _require_sha256_in_production(self) -> "Settings":
+        if self.ENVIRONMENT != "development" and not self.MODEL_SHA256:
+            raise ValueError(
+                "MODEL_SHA256 must be set when ENVIRONMENT is not 'development'. "
+                "Set MODEL_SHA256 to the SHA-256 checksum of the model file to "
+                "enable integrity verification, or set ENVIRONMENT=development to skip."
+            )
+        return self
 
     @property
     def max_file_size_bytes(self) -> int:

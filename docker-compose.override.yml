@@ -10,7 +10,7 @@ services:
       - ./frontend:/app
       - /app/node_modules
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_API_URL=http://localhost:8000/api
     read_only: false
 
   api:
@@ -22,11 +22,19 @@ services:
     read_only: false
     deploy: {}
 
+  worker-io:
+    volumes:
+      - ./backend:/app
+      - artifacts:/data/artifacts
+    read_only: false
+    deploy: {}
+
   worker-default:
     volumes:
       - ./backend:/app
       - artifacts:/data/artifacts
       - models:/data/models
+      - ./inference:/app/inference
     read_only: false
     deploy: {}
 
@@ -35,6 +43,7 @@ services:
       - ./backend:/app
       - artifacts:/data/artifacts
       - models:/data/models
+      - ./inference:/app/inference
     read_only: false
     deploy:
       resources:

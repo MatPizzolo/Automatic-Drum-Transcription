@@ -26,6 +26,8 @@ class JobStatus(str, enum.Enum):
     TRANSCRIBING = "transcribing"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
 
 
 class InputType(str, enum.Enum):
@@ -87,6 +89,9 @@ class Job(Base):
 
     # Webhook
     webhook_url = Column(String(512), nullable=True)
+
+    # Idempotency — SHA-256 of uploaded file content (null for YouTube jobs)
+    content_hash = Column(String(64), nullable=True, index=True)
 
     # Concurrency control
     user_identifier = Column(String(255), nullable=False, index=True)
