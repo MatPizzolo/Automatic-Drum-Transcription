@@ -2,6 +2,29 @@
 
 **Automatic drum transcription** — upload an audio file or paste a YouTube link, get drum sheet music (MusicXML + PDF).
 
+<div align="center">
+  
+### 🎵 Upload → 🤖 AI Processing → 🎼 Sheet Music
+
+<table>
+  <tr>
+    <td width="33%" align="center">
+      <img src="assets/screenshot.png" alt="DrumScribe Upload Interface" width="100%"/>
+      <br/><b>1. Upload Audio</b>
+    </td>
+    <td width="33%" align="center">
+      <img src="assets/screenshot-processing.png" alt="AI Processing" width="100%"/>
+      <br/><b>2. AI Processing</b>
+    </td>
+    <td width="33%" align="center">
+      <img src="assets/screenshot-result.png" alt="Final Sheet Music" width="100%"/>
+      <br/><b>3. Get Sheet Music</b>
+    </td>
+  </tr>
+</table>
+
+</div>
+
 A full-stack ML application that isolates drums from a mix using source separation, classifies individual hits with a CNN, and quantizes the output to standard music notation.
 
 ## System Architecture
