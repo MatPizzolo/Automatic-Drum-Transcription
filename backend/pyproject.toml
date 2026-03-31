@@ -1,0 +1,28 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra --tb=short --strict-markers -m 'not integration and not slow'"
+markers = [
+    "unit: pure unit tests — no I/O, no external services",
+    "integration: requires live services (PostgreSQL, Redis)",
+    "slow: downloads ML model weights or runs real inference",
+    "e2e: full end-to-end browser tests via Playwright",
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = [
+    "*/tests/*",
+    "*/alembic/*",
+    "app/core/telemetry.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "\\.\\.\\.",
+]
