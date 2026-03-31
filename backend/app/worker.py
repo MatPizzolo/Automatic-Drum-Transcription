@@ -170,7 +170,7 @@ def dispatch_pipeline(job_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Worker init signal — preload models at startup (Phase 4 will fill this in)
+# Worker init signal — preload models at startup
 # ---------------------------------------------------------------------------
 
 @worker_init.connect
@@ -256,7 +256,7 @@ def ingest_audio(job_id: str) -> str:
     reject_on_worker_lost=True,
 )
 def separate_drums(self, job_id: str) -> str:
-    """Demucs drum separation (heavy-compute queue)."""
+    """BS-Roformer drum separation (heavy-compute queue)."""
     import structlog
     logger = structlog.get_logger("task.separate_drums")
     start = time.monotonic()
@@ -315,7 +315,7 @@ def separate_drums(self, job_id: str) -> str:
     reject_on_worker_lost=True,
 )
 def predict_hits(self, job_id: str) -> str:
-    """CNN drum hit prediction (heavy-compute queue)."""
+    """AST drum hit prediction (heavy-compute queue)."""
     import structlog
     logger = structlog.get_logger("task.predict_hits")
     start = time.monotonic()
@@ -328,7 +328,7 @@ def predict_hits(self, job_id: str) -> str:
         _update_job(job_id, status="predicting", progress=55)
         _publish_status(job_id, "predicting", 55)
         logger.info("prediction_start", job_id=job_id)
-        _log_memory_usage(logger, "cnn_memory_before")
+        _log_memory_usage(logger, "ast_memory_before")
 
         drums_path = storage.get_file_path(job_id, "drums.wav")
 
@@ -344,7 +344,7 @@ def predict_hits(self, job_id: str) -> str:
         from app.schemas.ml_contracts import PredictionResult
         import json
         
-        # Phase 3: Idempotency check - skip expensive GPU inference if hits.json exists
+        # Idempotency check — skip expensive GPU inference if hits.json exists
         hits_path = storage.get_file_path(job_id, "hits.json")
         result = None
         
@@ -406,12 +406,12 @@ def predict_hits(self, job_id: str) -> str:
                 logger.info("applying_ml_guardrails")
                 result = apply_ml_guardrails(result)
         
-        _log_memory_usage(logger, "cnn_prediction_complete_memory")
-        
+        _log_memory_usage(logger, "ast_prediction_complete_memory")
+
         # Log prediction results
         total_hits = sum(result.get("hit_summary", {}).values())
         logger.info(
-            "cnn_prediction_results",
+            "ast_prediction_results",
             total_hits=total_hits,
             detected_bpm=result.get("detected_bpm"),
             bpm_unreliable=result.get("bpm_unreliable", False),
@@ -436,7 +436,7 @@ def predict_hits(self, job_id: str) -> str:
             progress=75,
         )
 
-        # Phase 3: Save complete prediction result with schema versioning
+        # Save complete prediction result with schema versioning
         # This includes schema_version and model_version for future compatibility
         hits_data = json.dumps(result, indent=2).encode()
         storage.save_file(job_id, "hits.json", hits_data)
@@ -448,7 +448,7 @@ def predict_hits(self, job_id: str) -> str:
         )
 
         gc.collect()
-        _log_memory_usage(logger, "cnn_cleanup_memory")
+        _log_memory_usage(logger, "ast_cleanup_memory")
 
         elapsed = int((time.monotonic() - start) * 1000)
         INFERENCE_LATENCY.labels(stage="prediction").observe(elapsed / 1000)

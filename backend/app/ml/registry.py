@@ -192,7 +192,7 @@ def preload_models() -> None:
     Called from worker_init signal handler.
     """
     try:
-        # Preload AST model (replaces Keras CNN)
+        # Preload AST model
         from app.ml.engine import _load_ast_model
         _load_ast_model()
         logger.info("ast_model_preloaded")

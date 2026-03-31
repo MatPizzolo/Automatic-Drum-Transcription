@@ -12,7 +12,6 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import numpy as np
 import pytest
 
 try:
@@ -24,37 +23,10 @@ except ImportError:
 requires_soundfile = pytest.mark.skipif(not HAS_SOUNDFILE, reason="soundfile not installed")
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Constants
 # ---------------------------------------------------------------------------
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
-
-
-@pytest.fixture
-def sample_audio(tmp_path):
-    """Generate a synthetic drum-like audio file for testing."""
-    pytest.importorskip("soundfile")
-    import soundfile as sf
-
-    sr = 44100
-    duration = 5.0  # seconds
-    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
-
-    # Simulate kick-like impulses at regular intervals
-    signal = np.zeros_like(t)
-    beat_interval = int(sr * 0.5)  # 120 BPM
-    for i in range(0, len(t), beat_interval):
-        # Short exponential decay burst
-        burst_len = min(2000, len(t) - i)
-        burst = np.exp(-np.linspace(0, 10, burst_len)) * 0.8
-        signal[i:i + burst_len] += burst
-
-    # Add some noise
-    signal += np.random.randn(len(signal)) * 0.01
-
-    audio_path = tmp_path / "test_drums.wav"
-    sf.write(str(audio_path), signal, sr)
-    return str(audio_path), sr, duration
 
 
 # ---------------------------------------------------------------------------

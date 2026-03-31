@@ -35,7 +35,13 @@ class Settings(BaseSettings):
 
     # Storage
     ARTIFACTS_DIR: str = "./artifacts"
+    MODEL_CACHE_DIR: str = "/data/models"
     STORAGE_BACKEND: str = "local"  # "local" or "s3"
+
+    # Model
+    MODEL_VERSION: str = "ast-audioset-10-10-0.4593"
+    MODEL_URI: str = ""      # Unused — models are fetched from HuggingFace / audio-separator
+    MODEL_SHA256: str = ""   # Unused — no checksum required for HuggingFace downloads
 
     # S3 Storage (only used when STORAGE_BACKEND=s3)
     S3_BUCKET: str = ""
@@ -76,7 +82,7 @@ class Settings(BaseSettings):
     # Confidence
     LOW_CONFIDENCE_THRESHOLD: float = 0.5
 
-    # Phase 4: Onset Detection Tuning
+    # Onset Detection Tuning
     ONSET_SENSITIVITY: float = 0.05  # Lower = more sensitive (catches ghost notes)
 
     # Modal Serverless GPU (optional - for cloud deployment)

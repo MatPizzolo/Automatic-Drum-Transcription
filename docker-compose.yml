@@ -7,17 +7,12 @@ x-common-env: &common-env
 x-storage-env: &storage-env
   ARTIFACTS_DIR: /data/artifacts
   MODEL_CACHE_DIR: /data/models
+  TORCH_HOME: /data/models
   STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
   S3_BUCKET: ${S3_BUCKET:-}
   S3_PREFIX: ${S3_PREFIX:-artifacts}
   S3_REGION: ${S3_REGION:-us-east-1}
   S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
-
-x-model-env: &model-env
-  MODEL_URI: /app/inference/pretrained_models/annoteators/complete_network.h5
-  MODEL_VERSION: ${MODEL_VERSION:-v1.0.0}
-  MODEL_SHA256: ${MODEL_SHA256:-}
-  TORCH_HOME: /app/inference/demucs
 
 x-security: &security
   cap_drop:
@@ -35,11 +30,11 @@ services:
     build:
       context: ./frontend
       args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api}
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     environment:
-      - API_URL=http://api:8000
+      - API_URL=http://api:8000/api
     depends_on:
       api:
         condition: service_healthy
@@ -101,12 +96,11 @@ services:
       --hostname=io@%h
     env_file: .env
     environment:
-      <<: [*common-env, *storage-env, *model-env]
+      <<: [*common-env, *storage-env]
       WORKER_MODE: "false"
     volumes:
       - artifacts:/data/artifacts
       - models:/data/models
-      - ./inference:/app/inference
     depends_on:
       postgres:
         condition: service_healthy
@@ -146,12 +140,11 @@ services:
       --hostname=default@%h
     env_file: .env
     environment:
-      <<: [*common-env, *storage-env, *model-env]
+      <<: [*common-env, *storage-env]
       PDF_BACKEND: ${PDF_BACKEND:-lilypond}
     volumes:
       - artifacts:/data/artifacts
       - models:/data/models
-      - ./inference:/app/inference
     depends_on:
       postgres:
         condition: service_healthy
@@ -177,7 +170,7 @@ services:
     networks:
       - drumscribe
 
-  # ---- Celery Worker: heavy-compute queue (Demucs, CNN) ----
+  # ---- Celery Worker: heavy-compute queue (BS-Roformer, AST) ----
   worker-heavy:
     build:
       context: ./backend
@@ -191,12 +184,12 @@ services:
       --hostname=heavy@%h
     env_file: .env
     environment:
-      <<: [*common-env, *storage-env, *model-env]
+      <<: [*common-env, *storage-env]
       PDF_BACKEND: ${PDF_BACKEND:-lilypond}
+      WORKER_MODE: "true"
     volumes:
       - artifacts:/data/artifacts
       - models:/data/models
-      - ./inference:/app/inference
     depends_on:
       postgres:
         condition: service_healthy
@@ -234,9 +227,7 @@ services:
       --schedule=/tmp/celerybeat-schedule
     env_file: .env
     environment:
-      <<: [*common-env, *model-env]
-    volumes:
-      - ./inference:/app/inference
+      <<: *common-env
     depends_on:
       redis:
         condition: service_healthy

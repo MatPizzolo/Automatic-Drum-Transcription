@@ -44,11 +44,13 @@ async def health_check(db: AsyncSession = Depends(get_db)):
     else:
         health["checks"]["redis"] = {"status": "skipped", "reason": "USE_CELERY=false"}
 
-    # Model availability check (just checks if path/URI is configured)
+    # Model availability check — verify cache directory is accessible
+    import os
+    cache_dir = settings.MODEL_CACHE_DIR
     health["checks"]["model"] = {
-        "status": "configured",
+        "status": "ready" if os.path.isdir(cache_dir) else "cache_dir_missing",
         "version": settings.MODEL_VERSION,
-        "uri": settings.MODEL_URI,
+        "cache_dir": cache_dir,
     }
 
     status_code = 200 if health["status"] == "healthy" else 503

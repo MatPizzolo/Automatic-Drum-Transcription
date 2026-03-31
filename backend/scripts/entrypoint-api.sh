@@ -116,27 +116,15 @@ sys.exit(asyncio.run(init_database()))
 log_success "Database migrations complete"
 
 # ============================================================================
-# Verify model file exists (if not using remote URI)
+# Verify model cache directory is accessible
 # ============================================================================
 
-if [[ "${MODEL_URI:-}" != http* ]] && [[ "${MODEL_URI:-}" != s3://* ]]; then
-    if [ -n "${MODEL_URI:-}" ]; then
-        # Handle both absolute and relative paths
-        if [[ "${MODEL_URI}" = /* ]]; then
-            MODEL_PATH="${MODEL_URI}"
-        else
-            MODEL_PATH="/app/${MODEL_URI}"
-        fi
-        
-        if [ -f "$MODEL_PATH" ]; then
-            MODEL_SIZE=$(du -h "$MODEL_PATH" | cut -f1)
-            log_success "Model file found: $MODEL_PATH ($MODEL_SIZE)"
-        else
-            log_error "Model file not found: $MODEL_PATH"
-            log_info "Please ensure the model file is mounted or downloaded"
-            exit 1
-        fi
-    fi
+CACHE_DIR="${MODEL_CACHE_DIR:-/data/models}"
+if [ -d "$CACHE_DIR" ]; then
+    log_success "Model cache directory ready: $CACHE_DIR"
+else
+    log_info "Model cache directory not found: $CACHE_DIR — creating"
+    mkdir -p "$CACHE_DIR"
 fi
 
 # ============================================================================

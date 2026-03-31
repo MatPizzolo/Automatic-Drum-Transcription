@@ -3,7 +3,7 @@
 End-to-end ML pipeline test client.
 
 Tests the complete transcription pipeline from audio upload/YouTube URL
-through Demucs separation, CNN prediction, and MusicXML/PDF export.
+through BS-Roformer drum separation, AST hit prediction, and MusicXML/PDF export.
 """
 
 import argparse

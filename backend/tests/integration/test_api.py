@@ -39,7 +39,7 @@ class TestHealthEndpoint:
         response = client.get("/api/v1/health")
         data = response.json()
         assert "model" in data["checks"]
-        assert data["checks"]["model"]["status"] == "configured"
+        assert data["checks"]["model"]["status"] in ("ready", "cache_dir_missing")
 
 
 class TestMetricsEndpoint:
@@ -99,10 +99,7 @@ class TestJobCreationValidation:
 class TestJobStatusNotFound:
     """Tests for GET /api/v1/jobs/{id} with non-existent job."""
 
-    @pytest.mark.skipif(
-        True,  # TODO: replace with DB availability check
-        reason="Requires running PostgreSQL",
-    )
+    @pytest.mark.integration
     def test_nonexistent_job_returns_404(self, client):
         fake_id = str(uuid.uuid4())
         response = client.get(f"/api/v1/jobs/{fake_id}")

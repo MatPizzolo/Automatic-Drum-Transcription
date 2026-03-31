@@ -1,8 +1,8 @@
 """
 PyTorch-native onset detection for drum transcription.
 
-Phase 4: Replaces librosa onset detection with GPU-compatible PyTorch implementation
-using spectral flux and adaptive peak picking.
+Uses spectral flux with adaptive peak picking, implemented
+as a GPU-compatible torchaudio transform pipeline.
 """
 
 import torch

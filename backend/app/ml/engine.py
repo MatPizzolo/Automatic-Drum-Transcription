@@ -1,14 +1,10 @@
 """
 ML Engine — orchestrates BS-Roformer drum separation and AST prediction.
 
-This module replicates the core logic from AnNOTEator's inference pipeline:
-- input_transform.py → drum_extraction, drum_to_frame
-- prediction.py → predict_drumhit
-
-Adapted for production use with:
+Responsibilities:
 - Singleton model loading for BS-Roformer and AST
 - Strict Pydantic validation (PredictionResult)
-- High-performance torchaudio tensor pipeline (Phase 2 optimization)
+- High-performance torchaudio tensor pipeline
 - Minimal CPU/GPU memory transfers
 """
 
@@ -37,7 +33,7 @@ logger = get_logger(__name__)
 # Instrument label mapping (7 drum classes)
 # Map from model output indices → our canonical instrument names
 # ---------------------------------------------------------------------------
-ANNOTEATOR_CLASSES = ["snare", "hihat_closed", "hihat_open", "kick", "ride", "tom_high", "crash"]
+DRUM_CLASSES = ["snare", "hihat_closed", "hihat_open", "kick", "ride", "tom_high", "crash"]
 
 # AudioSet class mapping to drum instruments
 # Based on AudioSet ontology - map relevant audio event classes to drum types
@@ -76,7 +72,7 @@ def run_drum_separation(input_path: str, output_path: str) -> None:
     """
     Isolate drums from a full mix using BS-Roformer via audio-separator.
 
-    Replicates AnNOTEator's drum_extraction() with state-of-the-art BS-Roformer model.
+    Isolate drums from a full mix using BS-Roformer via audio-separator.
     """
     from audio_separator.separator import Separator
     import torch
@@ -213,8 +209,6 @@ def run_prediction(
     """
     Run the full prediction pipeline on an isolated drum track.
 
-    Replicates AnNOTEator's drum_to_frame() + predict_drumhit().
-
     Returns dict with:
         detected_bpm, bpm_unreliable, duration_seconds, confidence_score,
         hit_summary, hits (list of {time, instrument, velocity})
@@ -243,8 +237,7 @@ def run_prediction(
     else:
         detected_bpm, bpm_unreliable = _detect_bpm(drum_track_np, sr)
 
-    # --- Phase 4: PyTorch-Native Onset Detection ---
-    # Replicate AnNOTEator's drum_to_frame logic with PyTorch tensors
+    # --- Onset Detection ---
     hop_length = 1024
     if detected_bpm > 110:
         hop_length = 512
@@ -274,14 +267,14 @@ def run_prediction(
         sensitivity=settings.ONSET_SENSITIVITY
     )
 
-    # Calculate window size based on 16th note duration (AnNOTEator default resolution=16)
+    # Calculate window size based on 16th note duration
     sixteenth_duration = 60 / detected_bpm / 4
     thirty_second_duration = 60 / detected_bpm / 8
     window_size = int(sixteenth_duration * sr)
     padding = int(thirty_second_duration / 4 * sr)
 
     # Extract audio clips for each onset
-    TARGET_LENGTH = 8820  # AnNOTEator's fixed frame size
+    TARGET_LENGTH = 8820  # Fixed frame size for AST input normalization
     clips = []
     valid_onset_times = []
 
@@ -311,8 +304,8 @@ def run_prediction(
             if clip_resampled.shape[0] > TARGET_LENGTH:
                 clip = clip_resampled[:TARGET_LENGTH].numpy()
             elif clip_resampled.shape[0] < TARGET_LENGTH:
-                padding = TARGET_LENGTH - clip_resampled.shape[0]
-                clip = torch.nn.functional.pad(clip_resampled, (0, padding)).numpy()
+                zero_pad_length = TARGET_LENGTH - clip_resampled.shape[0]
+                clip = torch.nn.functional.pad(clip_resampled, (0, zero_pad_length)).numpy()
             else:
                 clip = clip_resampled.numpy()
 
@@ -396,7 +389,7 @@ def run_prediction(
             torch.cuda.empty_cache()
 
     # Free raw audio and clips — no longer needed
-    del drum_track, clips, o_env, onset_frames, onset_samples
+    del drum_track_tensor, drum_track_np, drum_track_np_full, clips, onset_samples
 
     # Concatenate all batch predictions
     pred_raw = np.concatenate(all_predictions, axis=0)
@@ -412,7 +405,7 @@ def run_prediction(
     
     for i in range(pred_raw.shape[0]):
         onset_probs = pred_raw[i]
-        onset_hits = {inst: 0.0 for inst in ANNOTEATOR_CLASSES}
+        onset_hits = {inst: 0.0 for inst in DRUM_CLASSES}
         
         # Get top predictions above threshold
         top_indices = np.where(onset_probs > CONFIDENCE_THRESHOLD)[0]
@@ -433,17 +426,17 @@ def run_prediction(
                 onset_hits[drum_instrument] = confidence
         
         # Convert to binary array format (compatible with existing code)
-        onset_result = np.array([onset_hits[inst] for inst in ANNOTEATOR_CLASSES])
+        onset_result = np.array([onset_hits[inst] for inst in DRUM_CLASSES])
         results.append(onset_result)
     
     results = np.array(results)
 
     # --- Build hits list and summary ---
     hits: List[Dict[str, Any]] = []
-    hit_counts: Dict[str, int] = {name: 0 for name in ANNOTEATOR_CLASSES}
+    hit_counts: Dict[str, int] = {name: 0 for name in DRUM_CLASSES}
 
     for i, onset_time in enumerate(valid_onset_times):
-        for j, instrument in enumerate(ANNOTEATOR_CLASSES):
+        for j, instrument in enumerate(DRUM_CLASSES):
             # AST outputs confidence values (0.0-1.0), not binary
             confidence = results[i][j]
             if confidence > 0.0:  # Only include detected instruments

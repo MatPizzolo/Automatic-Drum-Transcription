@@ -1,37 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Model Setup Script - Delegates to Python model_manager module
-# 
-# This script is a thin wrapper around the production-grade Python model manager.
-# All model initialization logic has been moved to app/core/model_manager.py
-# for better error handling, logging, and maintainability.
+# Model Warm-Up Script
 #
-# Usage: ./scripts/download_models.sh
+# Ensures the model cache directory exists and pre-warms ML models
+# so the first job doesn't pay a cold-start penalty.
 #
-# Environment variables (read by model_manager.py):
-#   MODEL_URI: URL/path to CNN model
-#   MODEL_CACHE_DIR: Directory for model caching
-#   TORCH_HOME: Directory for torch.hub cache
-#   STORAGE_BACKEND: Storage backend type (local, s3)
+# Models are fetched automatically from their respective sources:
+#   - BS-Roformer: downloaded by audio-separator on first use
+#   - AST (MIT/ast-finetuned-audioset-10-10-0.4593): downloaded from HuggingFace
+#
+# Environment variables:
+#   MODEL_CACHE_DIR: Directory for model caching (default: /data/models)
+#   WORKER_MODE: Set to "true" to trigger model preloading (default: false)
+
+CACHE_DIR="${MODEL_CACHE_DIR:-/data/models}"
 
 echo "==> DrumScribe Model Setup"
-echo "==> Delegating to Python model manager..."
+echo "    MODEL_CACHE_DIR=${CACHE_DIR}"
 echo ""
 
-# Execute the Python model manager
-# This handles all model initialization with proper error handling
-python3 -m app.core.model_manager
+# Ensure cache directory exists with correct permissions
+mkdir -p "${CACHE_DIR}"
 
-# Capture exit code
-EXIT_CODE=$?
-
-if [ $EXIT_CODE -eq 0 ]; then
-    echo ""
-    echo "==> ✓ Model setup completed successfully"
-    exit 0
+# Pre-warm models if running as a heavy-compute worker
+if [ "${WORKER_MODE:-false}" = "true" ]; then
+    echo "==> Pre-warming ML models (WORKER_MODE=true)..."
+    python3 -c "
+import sys
+sys.path.insert(0, '/app')
+try:
+    from app.ml.registry import preload_models
+    preload_models()
+    print('==> Models pre-warmed successfully')
+except Exception as e:
+    print(f'==> Warning: Model pre-warming failed: {e}', file=sys.stderr)
+    print('==> Models will load lazily on first task execution')
+"
 else
-    echo ""
-    echo "==> ✗ Model setup failed (exit code: $EXIT_CODE)"
-    exit $EXIT_CODE
+    echo "==> Skipping model pre-warm (WORKER_MODE != true)"
+    echo "    Models will load lazily on first task execution"
 fi
+
+echo ""
+echo "==> ✓ Model setup complete"

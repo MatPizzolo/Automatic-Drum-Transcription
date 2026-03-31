@@ -70,11 +70,11 @@ class PredictionResult(BaseModel):
         le=1.0,
         description="Overall prediction confidence (mean of all hits)"
     )
-    hit_summary: Dict[str, int] = Field(
-        description="Count of hits per instrument type"
-    )
     hits: List[DrumHit] = Field(
         description="Chronologically sorted list of detected drum hits"
+    )
+    hit_summary: Dict[str, int] = Field(
+        description="Count of hits per instrument type"
     )
 
     @field_validator('hits')

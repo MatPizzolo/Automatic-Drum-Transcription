@@ -1,8 +1,8 @@
 """
 Transcription service — builds sheet music from predicted hits using symusic.
 
-Replicates the core logic from AnNOTEator's transcriber.py, adapted for
-our hit data format with strict Pydantic typing.
+Converts AST hit predictions to quantized MIDI sheet music
+with strict Pydantic typing.
 """
 
 from typing import Any, Dict, List, Union
@@ -89,7 +89,7 @@ def build_sheet_music(
     # Handle both Pydantic DrumHit objects and raw dicts
     hits_sorted = sorted(hits, key=lambda h: h.time if isinstance(h, DrumHit) else h["time"])
 
-    # Phase 4: Track quantization drift for each note
+    # Track quantization drift for each note
     quantization_drifts = []  # Store drift in milliseconds for each note
 
     # Convert hits to symusic Notes
@@ -131,7 +131,7 @@ def build_sheet_music(
     # Apply symusic's native quantization to 16th note grid
     quantize_unit = score.ticks_per_quarter // 4  # 16th note
     
-    # Phase 4: Calculate quantization drift for each note
+    # Calculate quantization drift for each note
     for note in drum_track.notes:
         original_time = getattr(note, '_original_time_ticks', note.time)
         quantized_time = round(note.time / quantize_unit) * quantize_unit
@@ -153,7 +153,7 @@ def build_sheet_music(
     # Add track to score
     score.tracks.append(drum_track)
 
-    # Phase 4: Calculate and log quantization drift metrics
+    # Calculate and log quantization drift metrics
     if quantization_drifts:
         avg_drift_ms = sum(quantization_drifts) / len(quantization_drifts)
         max_drift_ms = max(quantization_drifts)

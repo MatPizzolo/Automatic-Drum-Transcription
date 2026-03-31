@@ -20,7 +20,8 @@ RESET := $(shell tput sgr0 2>/dev/null)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help init status health up build rebuild down clean restart logs shell
+.PHONY: help init status health up build rebuild down clean restart logs shell \
+        test test-unit test-integration test-coverage test-frontend
 
 # ============================================================================
 # Help
@@ -42,6 +43,13 @@ help:
 	@echo "  make restart           - Restart running containers"
 	@echo "  make down              - Stop all containers"
 	@echo "  make clean             - Stop and remove all volumes (fresh start)"
+	@echo ""
+	@echo "$(BOLD)🧪 Testing:$(RESET)"
+	@echo "  make test              - Run all unit tests (fast, no services needed)"
+	@echo "  make test-unit         - Run unit tests only"
+	@echo "  make test-integration  - Run integration tests (requires running DB + Redis)"
+	@echo "  make test-coverage     - Run unit tests with HTML coverage report"
+	@echo "  make test-frontend     - Run frontend type-check + lint"
 	@echo ""
 	@echo "$(BOLD)🔍 Debugging:$(RESET)"
 	@echo "  make logs              - Tail all logs (SERVICE=api|frontend|postgres)"
@@ -161,6 +169,46 @@ db-reset:
 	else \
 		echo "❌ Database reset cancelled"; \
 	fi
+
+# ============================================================================
+# Testing
+# ============================================================================
+#
+# Backend tests are run inside the backend/ directory using the virtual env
+# or the system Python that has requirements-test.txt installed.
+#
+# Quick setup:
+#   cd backend && pip install -r requirements-test.txt
+#
+# See docs/TESTING.md for the full testing guide.
+
+PYTEST = cd backend && python -m pytest
+
+test: test-unit
+
+test-unit:
+	@echo "🧪 Running unit tests..."
+	@$(PYTEST) tests/unit/ -v --tb=short -m "not integration and not slow"
+	@echo "✅ Unit tests passed"
+
+test-integration:
+	@echo "🧪 Running integration tests (requires PostgreSQL + Redis)..."
+	@$(PYTEST) tests/integration/ tests/regression/ -v --tb=short -m "integration or not slow"
+	@echo "✅ Integration tests passed"
+
+test-coverage:
+	@echo "🧪 Running unit tests with coverage..."
+	@$(PYTEST) tests/unit/ \
+		--cov=app \
+		--cov-report=term-missing \
+		--cov-report=html:htmlcov \
+		-m "not integration and not slow"
+	@echo "✅ Coverage report generated at backend/htmlcov/index.html"
+
+test-frontend:
+	@echo "🧪 Running frontend checks..."
+	@cd frontend && npm run lint
+	@echo "✅ Frontend checks passed"
 
 # ============================================================================
 # Backward Compatibility (deprecated, will be removed)

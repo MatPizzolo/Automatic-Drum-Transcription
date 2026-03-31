@@ -26,6 +26,7 @@ services:
     volumes:
       - ./backend:/app
       - artifacts:/data/artifacts
+      - models:/data/models
     read_only: false
     deploy: {}
 
@@ -34,7 +35,6 @@ services:
       - ./backend:/app
       - artifacts:/data/artifacts
       - models:/data/models
-      - ./inference:/app/inference
     read_only: false
     deploy: {}
 
@@ -43,7 +43,6 @@ services:
       - ./backend:/app
       - artifacts:/data/artifacts
       - models:/data/models
-      - ./inference:/app/inference
     read_only: false
     deploy:
       resources:

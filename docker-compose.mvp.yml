@@ -4,17 +4,12 @@ x-common-env: &common-env
 x-storage-env: &storage-env
   ARTIFACTS_DIR: /data/artifacts
   MODEL_CACHE_DIR: /data/models
+  TORCH_HOME: /data/models
   STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
   S3_BUCKET: ${S3_BUCKET:-}
   S3_PREFIX: ${S3_PREFIX:-artifacts}
   S3_REGION: ${S3_REGION:-us-east-1}
   S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
-
-x-model-env: &model-env
-  MODEL_URI: /app/inference/pretrained_models/annoteators/complete_network.h5
-  MODEL_VERSION: ${MODEL_VERSION:-v1.0.0}
-  MODEL_SHA256: ${MODEL_SHA256:-}
-  TORCH_HOME: /app/inference/demucs
 
 x-security: &security
   cap_drop:
@@ -54,14 +49,13 @@ services:
       - "${API_PORT:-8000}:8000"
     env_file: .env
     environment:
-      <<: [*common-env, *storage-env, *model-env]
+      <<: [*common-env, *storage-env]
       USE_CELERY: "false"
       PDF_BACKEND: ${PDF_BACKEND:-lilypond}
       NUMBA_CACHE_DIR: /tmp/numba_cache
     volumes:
       - artifacts:/data/artifacts
       - models:/data/models
-      - ./inference:/app/inference
     depends_on:
       postgres:
         condition: service_healthy

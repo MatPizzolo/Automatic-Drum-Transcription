@@ -172,7 +172,7 @@ def _export_pdf_lilypond(musicxml_path: str, output_path: str) -> bool:
 
 def _export_pdf_musescore(musicxml_path: str, output_path: str) -> bool:
     """
-    Export MusicXML to PDF via MuseScore CLI (legacy backend).
+    Export MusicXML to PDF via MuseScore CLI.
 
     Requires MuseScore + xvfb for headless operation.
     """
