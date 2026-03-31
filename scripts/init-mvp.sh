@@ -53,20 +53,9 @@ fi
 
 # Ensure inference directory exists
 log_info "Setting up inference directory..."
-mkdir -p "$ROOT/inference/demucs" "$ROOT/inference/pretrained_models/annoteators"
+mkdir -p "$ROOT/inference/demucs"
 chmod -R 755 "$ROOT/inference" 2>/dev/null || true
 log_success "Inference directory ready"
-
-# Check if model file exists
-MODEL_FILE="$ROOT/inference/pretrained_models/annoteators/complete_network.h5"
-if [ ! -f "$MODEL_FILE" ]; then
-    log_error "Model file not found: $MODEL_FILE"
-    log_info "Please download the model first:"
-    echo "  cd inference/pretrained_models/annoteators"
-    echo "  wget https://your-model-url/complete_network.h5"
-    exit 1
-fi
-log_success "Model file found ($(du -h "$MODEL_FILE" | cut -f1))"
 
 echo ""
 log_info "Starting MVP stack..."
