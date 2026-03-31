@@ -43,13 +43,6 @@ class Settings(BaseSettings):
     S3_REGION: str = "us-east-1"
     S3_ENDPOINT_URL: str = ""  # For MinIO or localstack
 
-    # Model
-    MODEL_URI: str = ""  # Set to http://, https://, s3://, or file:// path
-    MODEL_VERSION: str = "v1.0.0"
-    MODEL_CACHE_DIR: str = "./model_cache"
-    MODEL_SHA256: str = ""  # Optional SHA256 checksum for integrity verification
-    DEMUCS_MODEL_NAME: str = "htdemucs"  # Override to use htdemucs_ft, mdx_extra, etc.
-
     # PDF Export — "lilypond", "musescore", or "none"
     PDF_BACKEND: str = "lilypond"
     LILYPOND_BIN: str = "lilypond"
@@ -71,7 +64,7 @@ class Settings(BaseSettings):
 
     # Observability
     PROMETHEUS_PORT: int = 9090
-    OTLP_ENDPOINT: str = "http://localhost:4317"
+    OTLP_ENDPOINT: str = "http://localhost:4318"
     LOG_LEVEL: str = "INFO"
 
     # Audio Validation
@@ -83,6 +76,14 @@ class Settings(BaseSettings):
     # Confidence
     LOW_CONFIDENCE_THRESHOLD: float = 0.5
 
+    # Phase 4: Onset Detection Tuning
+    ONSET_SENSITIVITY: float = 0.05  # Lower = more sensitive (catches ghost notes)
+
+    # Modal Serverless GPU (optional - for cloud deployment)
+    USE_MODAL: bool = False  # Set to True to use Modal serverless GPUs
+    MODAL_APP_NAME: str = "drumscribe-ml"
+    MODAL_FUNCTION_NAME: str = "process_audio_pipeline"
+
     # Celery
     USE_CELERY: bool = True
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
@@ -93,16 +94,6 @@ class Settings(BaseSettings):
         "env_file_encoding": "utf-8",
         "case_sensitive": True,
     }
-
-    @model_validator(mode="after")
-    def _require_sha256_in_production(self) -> "Settings":
-        if self.ENVIRONMENT != "development" and not self.MODEL_SHA256:
-            raise ValueError(
-                "MODEL_SHA256 must be set when ENVIRONMENT is not 'development'. "
-                "Set MODEL_SHA256 to the SHA-256 checksum of the model file to "
-                "enable integrity verification, or set ENVIRONMENT=development to skip."
-            )
-        return self
 
     @property
     def max_file_size_bytes(self) -> int:

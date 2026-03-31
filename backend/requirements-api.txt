@@ -34,3 +34,6 @@ aiofiles>=23.2.1
 
 # S3 Storage Backend (optional — only needed when STORAGE_BACKEND=s3)
 boto3>=1.34.0
+
+# Modal Serverless GPU (optional — only needed when USE_MODAL=true)
+modal>=0.63.0

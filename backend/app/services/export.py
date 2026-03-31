@@ -1,5 +1,5 @@
 """
-Export service — generates MusicXML and PDF from music21 streams.
+Export service — generates MusicXML and PDF from symusic scores.
 
 PDF export supports two backends (configured via PDF_BACKEND env var):
   - "lilypond"  — headless, no X11 needed, recommended for containers
@@ -9,7 +9,7 @@ PDF export supports two backends (configured via PDF_BACKEND env var):
 
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 
 from app.core.config import settings
 from app.utils.logging import get_logger
@@ -17,145 +17,48 @@ from app.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-def export_musicxml(music21_stream: Any, output_path: str) -> str:
-    """Export a music21 Stream to MusicXML format."""
+def export_musicxml(score: Any, output_path: str) -> str:
+    """
+    Export a symusic Score to MusicXML format.
+    
+    symusic natively supports MusicXML export via dump_musicxml() method.
+    Falls back to MIDI export if MusicXML is not supported.
+    """
     logger.info("export_musicxml_start", output=output_path)
     
-    # First attempt: try to write as-is
     try:
-        music21_stream.write("musicxml", fp=output_path)
-        logger.info("export_musicxml_complete", output=output_path, size=Path(output_path).stat().st_size)
-        return output_path
+        # Check if this is a symusic Score object
+        if hasattr(score, 'dump_musicxml'):
+            # symusic native MusicXML export
+            score.dump_musicxml(output_path)
+            logger.info("export_musicxml_complete", output=output_path, size=Path(output_path).stat().st_size)
+            return output_path
+        elif hasattr(score, 'dump_midi'):
+            # Fallback: export as MIDI, then convert to MusicXML
+            logger.warning("musicxml_not_supported_using_midi_fallback")
+            midi_path = str(Path(output_path).with_suffix('.mid'))
+            score.dump_midi(midi_path)
+            
+            # Convert MIDI to MusicXML using music21 as converter
+            try:
+                from music21 import converter
+                midi_score = converter.parse(midi_path)
+                midi_score.write("musicxml", fp=output_path)
+                Path(midi_path).unlink(missing_ok=True)  # Clean up temp MIDI
+                logger.info("export_musicxml_complete_via_midi", output=output_path, size=Path(output_path).stat().st_size)
+                return output_path
+            except Exception as conv_error:
+                logger.error("midi_to_musicxml_conversion_failed", error=str(conv_error))
+                # Keep the MIDI file as fallback
+                logger.info("keeping_midi_file_as_fallback", path=midi_path)
+                raise RuntimeError(f"MusicXML export failed, MIDI available at {midi_path}") from conv_error
+        else:
+            raise RuntimeError(f"Unsupported score type: {type(score)}. Expected symusic.Score")
+            
     except Exception as e:
         error_msg = str(e)
-        logger.warning("export_musicxml_first_attempt_failed", error=error_msg)
-        
-        # If it's a duration error, quantize and retry
-        if "inexpressible" in error_msg.lower() or "duration" in error_msg.lower() or "cannot convert" in error_msg.lower():
-            logger.info("export_musicxml_retry_with_quantization")
-            try:
-                # Quantize all durations to standard note values
-                _quantize_stream_durations(music21_stream)
-                
-                # Retry the write
-                music21_stream.write("musicxml", fp=output_path)
-                logger.info("export_musicxml_complete_after_quantization", output=output_path, size=Path(output_path).stat().st_size)
-                return output_path
-            except Exception as e2:
-                logger.error("export_musicxml_retry_failed", error=str(e2))
-                # Last resort: create a simplified version
-                logger.info("export_musicxml_creating_simplified_version")
-                try:
-                    _create_simplified_musicxml(music21_stream, output_path)
-                    logger.info("export_musicxml_simplified_success", output=output_path)
-                    return output_path
-                except Exception as e3:
-                    logger.error("export_musicxml_all_attempts_failed", error=str(e3))
-                    raise RuntimeError(f"MusicXML export failed after all retry attempts: {error_msg}") from e
-        else:
-            raise RuntimeError(f"MusicXML export failed: {error_msg}") from e
-
-
-def _quantize_stream_durations(music21_stream: Any) -> None:
-    """
-    Quantize all note durations in a stream to standard values.
-    This fixes "inexpressible durations" errors.
-    """
-    from music21 import duration
-    
-    # Standard duration values (in quarter notes)
-    STANDARD_DURATIONS = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
-    
-    for element in music21_stream.flatten().notesAndRests:
-        current_duration = element.duration.quarterLength
-        
-        # Find closest standard duration
-        closest = min(STANDARD_DURATIONS, key=lambda x: abs(x - current_duration))
-        
-        # Only change if different
-        if abs(closest - current_duration) > 0.01:
-            element.duration = duration.Duration(closest)
-
-
-def _create_simplified_musicxml(music21_stream: Any, output_path: str) -> None:
-    """
-    Create a simplified MusicXML by rebuilding the stream with only essential elements.
-    This is a last resort when normal export fails.
-    """
-    from music21 import stream, note, meter, tempo, metadata, duration, percussion, instrument, clef
-    
-    # Create a new simplified stream with measures
-    simplified = stream.Score()
-    part = stream.Part()
-    
-    # Set part metadata for drums
-    part.partName = "Drums"
-    
-    # Add metadata
-    if hasattr(music21_stream, 'metadata') and music21_stream.metadata:
-        simplified.insert(0, metadata.Metadata())
-        if hasattr(music21_stream.metadata, 'title'):
-            simplified.metadata.title = music21_stream.metadata.title
-    
-    # Get time signature and tempo from original
-    time_sig = meter.TimeSignature('4/4')  # Default
-    tempo_mark = tempo.MetronomeMark(number=120)  # Default
-    
-    for element in music21_stream.flatten():
-        if isinstance(element, meter.TimeSignature):
-            time_sig = element
-            break
-    
-    for element in music21_stream.flatten():
-        if isinstance(element, tempo.MetronomeMark):
-            tempo_mark = element
-            break
-    
-    # Insert percussion metadata at the start of the part
-    part.insert(0, instrument.Percussion())
-    part.insert(0, clef.PercussionClef())
-    
-    # Add time signature and tempo to part
-    part.insert(0, time_sig)
-    part.insert(0, tempo_mark)
-    
-    # Add all notes with standard eighth-note duration, rounded to nearest eighth
-    for element in music21_stream.flatten().notesAndRests:
-        # Round offset to nearest eighth note (0.5 quarter notes)
-        rounded_offset = round(element.offset * 2) / 2
-        
-        if isinstance(element, percussion.PercussionChord):
-            # Handle percussion chords
-            new_chord = percussion.PercussionChord(element.pitches)
-            new_chord.duration = duration.Duration(0.5)
-            if hasattr(element, 'stemDirection'):
-                new_chord.stemDirection = element.stemDirection
-            part.insert(rounded_offset, new_chord)
-        elif isinstance(element, note.Unpitched):
-            # Handle unpitched drum notes
-            new_note = note.Unpitched(element.displayName)
-            new_note.duration = duration.Duration(0.5)  # Eighth note
-            if hasattr(element, 'notehead'):
-                new_note.notehead = element.notehead
-            if hasattr(element, 'stemDirection'):
-                new_note.stemDirection = element.stemDirection
-            part.insert(rounded_offset, new_note)
-        elif hasattr(element, 'pitch'):
-            # Handle regular pitched notes (fallback)
-            new_note = note.Note(element.pitch)
-            new_note.duration = duration.Duration(0.5)
-            if hasattr(element, 'notehead'):
-                new_note.notehead = element.notehead
-            if hasattr(element, 'stemDirection'):
-                new_note.stemDirection = element.stemDirection
-            part.insert(rounded_offset, new_note)
-    
-    # Make measures (without fillGaps parameter)
-    part = part.makeMeasures()
-    simplified.append(part)
-    
-    # Write to file
-    simplified.write("musicxml", fp=output_path)
+        logger.error("export_musicxml_failed", error=error_msg)
+        raise RuntimeError(f"MusicXML export failed: {error_msg}") from e
 
 
 def export_pdf(musicxml_path: str, output_path: str) -> bool:
@@ -208,8 +111,7 @@ def _export_pdf_lilypond(musicxml_path: str, output_path: str) -> bool:
                 returncode=result.returncode,
                 stderr=result.stderr[:500] if result.stderr else "",
             )
-            # Fallback: try direct LilyPond conversion
-            return _export_pdf_direct_lilypond(musicxml_path, output_path)
+            return False
 
         # Step 2: Run LilyPond CLI to produce PDF
         cmd = [
@@ -265,34 +167,6 @@ def _export_pdf_lilypond(musicxml_path: str, output_path: str) -> bool:
 
     except Exception as e:
         logger.error("export_pdf_lilypond_error", error=str(e))
-        return False
-
-
-def _export_pdf_direct_lilypond(musicxml_path: str, output_path: str) -> bool:
-    """
-    Fallback: Use music21 to convert MusicXML to PDF via LilyPond.
-    This may have compatibility issues but is better than nothing.
-    """
-    logger.info("export_pdf_direct_lilypond_fallback", input=musicxml_path)
-    
-    try:
-        from music21 import converter
-        
-        # Load MusicXML
-        score = converter.parse(musicxml_path)
-        
-        # Write directly to PDF (music21 will use LilyPond internally)
-        score.write("lily.pdf", fp=output_path)
-        
-        if Path(output_path).exists():
-            logger.info("export_pdf_direct_lilypond_success", output=output_path)
-            return True
-        else:
-            logger.warning("export_pdf_direct_lilypond_failed")
-            return False
-            
-    except Exception as e:
-        logger.error("export_pdf_direct_lilypond_error", error=str(e))
         return False
 
 

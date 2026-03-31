@@ -7,28 +7,21 @@ soundfile==0.13.1
 numpy==1.26.4
 
 # ML Pipeline - Drum Separation
-demucs==4.0.1
-torch>=2.0.0
+audio-separator[gpu]==0.22.2
+
+# ML Pipeline - Transformer-based Hit Detection
+torch>=2.0.0,<3.0.0
+transformers>=4.35.0
 torchaudio>=2.0.0
 
-# ML Pipeline - CNN Inference
-tensorflow==2.16.2
-
-
-# ML Pipeline - BPM Detection (Cython installed in Dockerfile before pip install)
-madmom==0.16.1
-
-# ML Pipeline - Transcription
-music21==9.3.0
+# ML Pipeline - Modern Symbolic Music Processing
+symusic>=0.4.0
 
 # YouTube Download
 yt-dlp==2024.12.23
 
 # S3 Storage Backend
 boto3>=1.34.0
-
-# System monitoring
-psutil==6.1.1
 
 # Celery instrumentation
 opentelemetry-instrumentation-celery==0.48b0

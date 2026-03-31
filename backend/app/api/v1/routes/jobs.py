@@ -413,9 +413,9 @@ async def get_job_result(
     # Build download URLs
     download_urls = {}
     if job.result_musicxml_path:
-        download_urls["musicxml"] = f"/api/v1/jobs/{job.id}/download/musicxml"
+        download_urls["musicxml"] = f"/api/jobs/{job.id}/download/musicxml"
     if job.result_pdf_path:
-        download_urls["pdf"] = f"/api/v1/jobs/{job.id}/download/pdf"
+        download_urls["pdf"] = f"/api/jobs/{job.id}/download/pdf"
 
     # Load hits from JSON file produced by the prediction stage
     import json
@@ -424,10 +424,11 @@ async def get_job_result(
     hits_path = storage.get_file_path(str(job.id), "hits.json")
     if storage.file_exists(hits_path):
         try:
-            raw_hits = json.loads(storage.read_file(hits_path))
+            raw = json.loads(storage.read_file(hits_path))
+            hits_list = raw.get("hits", []) if isinstance(raw, dict) else raw
             hits = [
                 HitData(time=h["time"], instrument=h["instrument"], velocity=h["velocity"])
-                for h in raw_hits
+                for h in hits_list
             ]
         except Exception:
             pass  # Graceful — return empty hits if file is corrupt

@@ -38,7 +38,6 @@ class ModelResolver:
         self.model_uri = model_uri or settings.MODEL_URI
         self.model_version = model_version or settings.MODEL_VERSION
         self.model_sha256 = model_sha256 or settings.MODEL_SHA256
-        self._keras_model = None
 
     def get_model(self, name: str = "complete_network", version: str = "latest") -> str:
         """
@@ -143,18 +142,6 @@ class ModelResolver:
         s3.download_file(bucket, key, dest)
         logger.info("model_downloaded", dest=dest, size=os.path.getsize(dest))
 
-    def get_keras_model(self, name: str = "complete_network", version: str = "latest"):
-        """Load and cache the Keras CNN model (singleton)."""
-        if self._keras_model is not None:
-            return self._keras_model
-
-        model_path = self.get_model(name, version)
-
-        from tensorflow import keras
-        self._keras_model = keras.models.load_model(model_path)
-        logger.info("keras_model_loaded", path=model_path)
-        return self._keras_model
-
     @property
     def version(self) -> str:
         return self.model_version
@@ -175,15 +162,45 @@ def get_model_resolver() -> ModelResolver:
     return _resolver
 
 
+def preload_separator_model() -> None:
+    """
+    Preload BS-Roformer model at worker startup.
+    Downloads .ckpt file to MODEL_CACHE_DIR to prevent re-downloads during tasks.
+    """
+    from audio_separator.separator import Separator
+    
+    logger.info("separator_preload_start")
+    
+    # Initialize Separator with cache directory
+    temp_separator = Separator(
+        output_dir="/tmp",  # Temporary, won't be used
+        model_file_dir=settings.MODEL_CACHE_DIR,
+    )
+    
+    # Load model - this triggers download to cache if not present
+    try:
+        temp_separator.load_model(model_filename="model_bs_roformer_ep_368_sdr_12.9628.ckpt")
+        logger.info("separator_model_preloaded", cache_dir=settings.MODEL_CACHE_DIR)
+    except Exception as e:
+        logger.error("separator_preload_failed", error=str(e))
+        raise SystemExit(1) from e
+
+
 def preload_models() -> None:
     """
     Preload models at worker startup.
     Called from worker_init signal handler.
     """
-    resolver = get_model_resolver()
     try:
-        resolver.get_keras_model()
-        logger.info("models_preloaded")
+        # Preload AST model (replaces Keras CNN)
+        from app.ml.engine import _load_ast_model
+        _load_ast_model()
+        logger.info("ast_model_preloaded")
+        
+        # Preload BS-Roformer separator model
+        preload_separator_model()
+        
+        logger.info("all_models_preloaded")
     except Exception as e:
         logger.error("model_preload_failed", error=str(e))
         raise SystemExit(1) from e

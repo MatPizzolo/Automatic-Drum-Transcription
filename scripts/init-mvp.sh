@@ -76,7 +76,7 @@ echo ""
 # Start containers
 # ============================================================================
 
-docker-compose -f docker-compose.mvp.yml up -d --remove-orphans
+docker compose -f docker-compose.mvp.yml up -d --remove-orphans
 
 # ============================================================================
 # Wait for services to be healthy
@@ -90,7 +90,7 @@ log_info "Checking PostgreSQL..."
 MAX_RETRIES=30
 RETRY=0
 while [ $RETRY -lt $MAX_RETRIES ]; do
-    if docker-compose -f docker-compose.mvp.yml exec -T postgres pg_isready -U drumscribe >/dev/null 2>&1; then
+    if docker compose -f docker-compose.mvp.yml exec -T postgres pg_isready -U drumscribe >/dev/null 2>&1; then
         log_success "PostgreSQL is ready"
         break
     fi
@@ -103,6 +103,7 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
 done
 
 # Wait for API to be healthy
+
 log_info "Checking API server..."
 RETRY=0
 while [ $RETRY -lt $MAX_RETRIES ]; do
@@ -113,7 +114,7 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
     RETRY=$((RETRY + 1))
     if [ $RETRY -eq $MAX_RETRIES ]; then
         log_error "API server failed to start after ${MAX_RETRIES}s"
-        log_info "Check logs with: make logs-api"
+        log_info "Check logs with: make logs SERVICE=api"
         exit 1
     fi
     sleep 1
@@ -140,13 +141,13 @@ done
 # ============================================================================
 
 log_info "Verifying database schema..."
-TABLE_COUNT=$(docker-compose -f docker-compose.mvp.yml exec -T postgres \
+TABLE_COUNT=$(docker compose -f docker-compose.mvp.yml exec -T postgres \
     psql -U drumscribe -d drumscribe -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
 
 if [ "$TABLE_COUNT" -eq "0" ]; then
     log_error "No database tables found!"
     log_info "Restarting API to trigger migrations..."
-    docker-compose -f docker-compose.mvp.yml restart api
+    docker compose -f docker-compose.mvp.yml restart api
     
     # Wait for API to be healthy after restart (migrations run during startup)
     log_info "Waiting for API to complete migrations..."
@@ -166,12 +167,12 @@ if [ "$TABLE_COUNT" -eq "0" ]; then
     done
     
     # Verify tables were created
-    TABLE_COUNT=$(docker-compose -f docker-compose.mvp.yml exec -T postgres \
+    TABLE_COUNT=$(docker compose -f docker-compose.mvp.yml exec -T postgres \
         psql -U drumscribe -d drumscribe -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
     
     if [ "$TABLE_COUNT" -eq "0" ]; then
         log_error "Database migration failed - no tables created"
-        log_info "Check API logs: docker-compose -f docker-compose.mvp.yml logs api"
+        log_info "Check API logs: docker compose -f docker-compose.mvp.yml logs api"
         exit 1
     fi
 fi
@@ -209,8 +210,8 @@ echo "  📊 Health:    http://localhost:8000/api/health"
 echo "  📖 API Docs:  http://localhost:8000/docs"
 echo ""
 echo "Useful commands:"
-echo "  make logs-api       - View API logs"
-echo "  make logs-frontend  - View frontend logs"
+echo "  make logs SERVICE=api       - View API logs"
+echo "  make logs SERVICE=frontend  - View frontend logs"
 echo "  make down           - Stop all services"
 echo "  make clean          - Stop and remove volumes"
 echo ""

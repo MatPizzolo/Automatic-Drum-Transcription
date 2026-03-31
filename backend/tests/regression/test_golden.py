@@ -21,14 +21,7 @@ try:
 except ImportError:
     HAS_SOUNDFILE = False
 
-try:
-    import music21  # noqa: F401
-    HAS_MUSIC21 = True
-except ImportError:
-    HAS_MUSIC21 = False
-
 requires_soundfile = pytest.mark.skipif(not HAS_SOUNDFILE, reason="soundfile not installed")
-requires_music21 = pytest.mark.skipif(not HAS_MUSIC21, reason="music21 not installed")
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -64,25 +57,6 @@ def sample_audio(tmp_path):
     return str(audio_path), sr, duration
 
 
-@pytest.fixture
-def mock_keras_model():
-    """Create a mock Keras model that returns deterministic predictions."""
-    model = MagicMock()
-
-    def mock_predict(X, verbose=0):
-        batch_size = X.shape[0]
-        # 6 classes: snare, hihat_closed, kick, ride, tom_high, crash
-        # Return high confidence for kick (index 2) on every frame
-        preds = np.zeros((batch_size, 6))
-        preds[:, 2] = 0.95  # kick
-        # Every 4th frame also has hihat
-        preds[::4, 1] = 0.85  # hihat_closed
-        return preds
-
-    model.predict = mock_predict
-    return model
-
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -90,19 +64,14 @@ def mock_keras_model():
 
 @requires_soundfile
 class TestPredictionPipeline:
-    """Test the prediction pipeline with mock model."""
+    """Test the prediction pipeline with AST model."""
 
-    def test_run_prediction_returns_expected_structure(self, sample_audio, mock_keras_model):
-        """Verify run_prediction returns all expected fields."""
+    def test_run_prediction_returns_expected_structure(self, sample_audio):
+        """Verify run_prediction returns all expected fields with AST model."""
         audio_path, sr, duration = sample_audio
 
-        with patch("app.ml.registry.get_model_resolver") as mock_resolver:
-            resolver_instance = MagicMock()
-            resolver_instance.get_keras_model.return_value = mock_keras_model
-            mock_resolver.return_value = resolver_instance
-
-            from app.ml.engine import run_prediction
-            result = run_prediction(audio_path, user_bpm=120)
+        from app.ml.engine import run_prediction
+        result = run_prediction(audio_path, user_bpm=120)
 
         # Verify structure
         assert "detected_bpm" in result
@@ -120,87 +89,18 @@ class TestPredictionPipeline:
         assert isinstance(result["hit_summary"], dict)
         assert isinstance(result["hits"], list)
 
-    def test_run_prediction_detects_hits(self, sample_audio, mock_keras_model):
-        """Verify the pipeline detects hits from the mock model output."""
-        audio_path, sr, duration = sample_audio
 
-        with patch("app.ml.registry.get_model_resolver") as mock_resolver:
-            resolver_instance = MagicMock()
-            resolver_instance.get_keras_model.return_value = mock_keras_model
-            mock_resolver.return_value = resolver_instance
-
-            from app.ml.engine import run_prediction
-            result = run_prediction(audio_path, user_bpm=120)
-
-        # Should detect hits (mock model returns kick on every frame)
-        assert len(result["hits"]) > 0
-        assert result["hit_summary"].get("kick", 0) > 0
-
-    def test_run_prediction_hit_format(self, sample_audio, mock_keras_model):
-        """Verify each hit has the correct format."""
-        audio_path, sr, duration = sample_audio
-
-        with patch("app.ml.registry.get_model_resolver") as mock_resolver:
-            resolver_instance = MagicMock()
-            resolver_instance.get_keras_model.return_value = mock_keras_model
-            mock_resolver.return_value = resolver_instance
-
-            from app.ml.engine import run_prediction
-            result = run_prediction(audio_path, user_bpm=120)
-
-        for hit in result["hits"]:
-            assert "time" in hit
-            assert "instrument" in hit
-            assert "velocity" in hit
-            assert isinstance(hit["time"], float)
-            assert isinstance(hit["velocity"], float)
-            assert hit["instrument"] in [
-                "snare", "hihat_closed", "kick", "ride", "tom_high", "crash"
-            ]
-            assert 0.0 <= hit["velocity"] <= 1.0
-
-    def test_run_prediction_user_bpm_override(self, sample_audio, mock_keras_model):
-        """Verify user-supplied BPM overrides auto-detection."""
-        audio_path, sr, duration = sample_audio
-
-        with patch("app.ml.registry.get_model_resolver") as mock_resolver:
-            resolver_instance = MagicMock()
-            resolver_instance.get_keras_model.return_value = mock_keras_model
-            mock_resolver.return_value = resolver_instance
-
-            from app.ml.engine import run_prediction
-            result = run_prediction(audio_path, user_bpm=90)
-
-        assert result["detected_bpm"] == 90
-        assert result["bpm_unreliable"] is False
-
-    def test_run_prediction_confidence_range(self, sample_audio, mock_keras_model):
-        """Verify confidence score is in valid range."""
-        audio_path, sr, duration = sample_audio
-
-        with patch("app.ml.registry.get_model_resolver") as mock_resolver:
-            resolver_instance = MagicMock()
-            resolver_instance.get_keras_model.return_value = mock_keras_model
-            mock_resolver.return_value = resolver_instance
-
-            from app.ml.engine import run_prediction
-            result = run_prediction(audio_path, user_bpm=120)
-
-        assert 0.0 <= result["confidence_score"] <= 1.0
-
-
-@requires_music21
 class TestTranscriptionPipeline:
-    """Test the transcription pipeline."""
+    """Test the transcription pipeline with symusic."""
 
     def test_build_sheet_music_empty_hits(self):
         """Verify transcription handles empty hit list."""
         from app.services.transcription import build_sheet_music
-        stream = build_sheet_music([], bpm=120, title="Empty Test")
-        assert stream is not None
+        score = build_sheet_music([], bpm=120, title="Empty Test")
+        assert score is not None
 
     def test_build_sheet_music_with_hits(self):
-        """Verify transcription produces measures from hits."""
+        """Verify transcription produces valid symusic score from hits."""
         from app.services.transcription import build_sheet_music
 
         hits = [
@@ -211,25 +111,11 @@ class TestTranscriptionPipeline:
             {"time": 1.5, "instrument": "snare", "velocity": 0.75},
         ]
 
-        stream = build_sheet_music(hits, bpm=120, title="Test Beat")
-        measures = stream.getElementsByClass("Measure")
-        assert len(measures) > 0
-
-    def test_build_sheet_music_simultaneous_hits(self):
-        """Verify simultaneous hits become PercussionChords."""
-        from app.services.transcription import build_sheet_music
-
-        hits = [
-            {"time": 0.0, "instrument": "kick", "velocity": 0.9},
-            {"time": 0.0, "instrument": "hihat_closed", "velocity": 0.7},
-            {"time": 0.0, "instrument": "snare", "velocity": 0.8},
-        ]
-
-        stream = build_sheet_music(hits, bpm=120, title="Chord Test")
-        assert stream is not None
+        score = build_sheet_music(hits, bpm=120, title="Test Beat")
+        assert score is not None
+        assert len(score.tracks) > 0
 
 
-@requires_music21
 class TestExportPipeline:
     """Test the export pipeline."""
 

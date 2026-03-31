@@ -17,6 +17,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate docker-compose.yml
         run: docker compose -f docker-compose.yml config --quiet
+      - name: Validate docker-compose.mvp.yml
+        run: docker compose -f docker-compose.mvp.yml config --quiet
 
   # ---- Backend: lint + unit tests ----
   backend-test:
@@ -67,6 +69,9 @@ jobs:
           - name: api
             context: ./backend
             file: ./backend/infrastructure/Dockerfile.api
+          - name: mvp
+            context: ./backend
+            file: ./backend/infrastructure/Dockerfile.mvp
           - name: worker
             context: ./backend
             file: ./backend/infrastructure/Dockerfile.worker

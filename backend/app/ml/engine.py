@@ -1,11 +1,15 @@
 """
-ML Engine — orchestrates Demucs drum separation and CNN prediction.
+ML Engine — orchestrates BS-Roformer drum separation and AST prediction.
 
 This module replicates the core logic from AnNOTEator's inference pipeline:
 - input_transform.py → drum_extraction, drum_to_frame
 - prediction.py → predict_drumhit
 
-Adapted for production use with singleton model loading and structured outputs.
+Adapted for production use with:
+- Singleton model loading for BS-Roformer and AST
+- Strict Pydantic validation (PredictionResult)
+- High-performance torchaudio tensor pipeline (Phase 2 optimization)
+- Minimal CPU/GPU memory transfers
 """
 
 import gc
@@ -18,114 +22,188 @@ from typing import Any, Dict, List, Optional
 import librosa
 import numpy as np
 import soundfile as sf
+import torch
+import torchaudio
+from transformers import ASTFeatureExtractor, ASTForAudioClassification
 
 from app.core.config import settings
+from app.ml.onset_detection import _detect_onsets_pytorch
+from app.schemas.ml_contracts import PredictionResult
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Instrument label mapping (AnNOTEator uses 6 classes)
+# Instrument label mapping (7 drum classes)
 # Map from model output indices → our canonical instrument names
 # ---------------------------------------------------------------------------
-ANNOTEATOR_CLASSES = ["snare", "hihat_closed", "kick", "ride", "tom_high", "crash"]
+ANNOTEATOR_CLASSES = ["snare", "hihat_closed", "hihat_open", "kick", "ride", "tom_high", "crash"]
 
-# Mel-spectrogram parameters — must match AnNOTEator training config exactly
-MEL_N_FFT = 2048
-MEL_HOP_LENGTH = 512
-MEL_N_MELS = 128
-MEL_FMAX = 8000
-MEL_POWER = 2.0
+# AudioSet class mapping to drum instruments
+# Based on AudioSet ontology - map relevant audio event classes to drum types
+AUDIOSET_TO_DRUM_MAP = {
+    # Bass drum / Kick drum class indices
+    "Bass drum": "kick",
+    "Kick drum": "kick",
+    # Snare drum class indices
+    "Snare drum": "snare",
+    # Hi-hat class indices (closed vs open based on label keywords)
+    "Hi-hat": "hihat_closed",  # Default to closed
+    "Closed hi-hat": "hihat_closed",
+    "Open hi-hat": "hihat_open",
+    "Cymbal": "hihat_closed",  # Generic cymbal defaults to closed hi-hat
+    # Ride cymbal
+    "Ride cymbal": "ride",
+    # Crash cymbal
+    "Crash cymbal": "crash",
+    # Tom drums
+    "Tom-tom": "tom_high",
+    "Drum": "snare",  # Generic drum, default to snare
+}
 
-# Demucs model singleton (loaded once per worker process)
-_demucs_model = None
-_demucs_device = None
-_demucs_lock = threading.Lock()
-# AnNOTEator order: SD, HH, KD, RC, TT, CC
+# Audio-separator singleton (loaded once per worker process)
+_separator_instance = None
+_separator_lock = threading.Lock()
+
+# AST model singleton (loaded once per worker process)
+_ast_model = None
+_ast_feature_extractor = None
+_ast_lock = threading.Lock()
+_ast_device = None
 
 
 def run_drum_separation(input_path: str, output_path: str) -> None:
     """
-    Isolate drums from a full mix using Demucs.
+    Isolate drums from a full mix using BS-Roformer via audio-separator.
 
-    Replicates AnNOTEator's drum_extraction() with kernel='demucs', mode='performance'.
+    Replicates AnNOTEator's drum_extraction() with state-of-the-art BS-Roformer model.
     """
+    from audio_separator.separator import Separator
     import torch
-    from demucs import pretrained, apply
-    from demucs.audio import AudioFile
-
-    global _demucs_model, _demucs_device
-
-    with _demucs_lock:
-        if _demucs_model is None:
-            logger.info("demucs_loading_model")
-            _demucs_model = pretrained.get_model(settings.DEMUCS_MODEL_NAME)
-            _demucs_model.eval()
-            _demucs_device = "cuda" if torch.cuda.is_available() else "cpu"
-            _demucs_model.to(_demucs_device)
-        else:
-            logger.info("demucs_using_cached_model")
-
-    model = _demucs_model
-    device = _demucs_device
-
-    logger.info("demucs_processing", input=input_path, device=device)
-
-    # Load audio
-    wav = AudioFile(input_path).read(
-        streams=0,
-        samplerate=model.samplerate,
-        channels=model.audio_channels,
-    )
-
-    # Normalize
-    ref = wav.mean(0)
-    wav = (wav - ref.mean()) / ref.std()
-
-    # Apply model
-    num_workers = min(multiprocessing.cpu_count(), 4)
-    sources = apply.apply_model(
-        model,
-        wav[None].to(device),
-        device=device,
-        shifts=1,
-        split=True,
-        overlap=0.25,
-        progress=True,
-        num_workers=num_workers,
-    )[0]
-
-    # Denormalize
-    sources = sources * ref.std() + ref.mean()
-
-    # Extract drums (index 0 in htdemucs source order: drums, bass, other, vocals)
-    drums = sources[0].cpu().numpy()
-    drums_mono = librosa.to_mono(drums)
-
-    # Free all 4 stem tensors immediately — only drums are needed downstream
-    del sources, drums
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # Save atomically — write to temp file then rename to prevent corrupt artifacts on crash
     import tempfile
+
+    global _separator_instance
+
+    with _separator_lock:
+        if _separator_instance is None:
+            logger.info("separator_loading_model")
+            
+            # Initialize Separator with output_dir set to parent of output_path
+            output_dir = str(Path(output_path).parent)
+            _separator_instance = Separator(
+                output_dir=output_dir,
+                output_format="wav",
+                output_single_stem="Drums",  # BS-Roformer uses "Drums" (capital D)
+                model_file_dir=settings.MODEL_CACHE_DIR,  # Use existing cache dir
+            )
+            
+            # Load BS-Roformer model
+            _separator_instance.load_model(model_filename="model_bs_roformer_ep_368_sdr_12.9628.ckpt")
+            logger.info("separator_model_loaded")
+        else:
+            logger.info("separator_using_cached_instance")
+
+    logger.info("separator_processing", input=input_path)
+
+    # audio-separator returns list of output file paths
+    output_files = _separator_instance.separate(input_path)
+
+    # Find the drums output file
+    drums_output = None
+    for f in output_files:
+        if "Drums" in f or "drums" in f:
+            drums_output = f
+            break
+
+    if drums_output is None or not Path(drums_output).exists():
+        raise RuntimeError(f"Separator did not produce drums output. Got: {output_files}")
+
+    # Load separated drums using torchaudio (keeps data as tensors)
+    drums_tensor, sr = torchaudio.load(drums_output)
+
+    # Convert to mono via tensor operations (avoid NumPy conversion)
+    if drums_tensor.shape[0] > 1:
+        # Stereo to mono: average across channels
+        drums_mono = drums_tensor.mean(dim=0, keepdim=False)
+    else:
+        drums_mono = drums_tensor.squeeze(0)
+    
+    # Convert to NumPy only for final write (soundfile requires NumPy)
+    drums_mono_np = drums_mono.cpu().numpy()
+
+    # Atomic write (preserve existing pattern)
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", dir=str(Path(output_path).parent))
     try:
         os.close(tmp_fd)
-        sf.write(tmp_path, drums_mono, model.samplerate)
+        sf.write(tmp_path, drums_mono_np, sr)
         os.replace(tmp_path, output_path)
     except Exception:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
+    finally:
+        # Clean up separator's original output file
+        if drums_output and Path(drums_output).exists() and drums_output != output_path:
+            Path(drums_output).unlink()
 
-    logger.info("demucs_complete", output=output_path, samplerate=model.samplerate)
+    logger.info("separator_complete", output=output_path, samplerate=sr)
 
     # Memory cleanup (don't delete model — it's cached as singleton)
-    del wav
+    del drums_tensor, drums_mono, drums_mono_np
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _load_ast_model():
+    """
+    Load Audio Spectrogram Transformer model (singleton pattern).
+    Returns (model, feature_extractor, device).
+    """
+    global _ast_model, _ast_feature_extractor, _ast_device, _ast_lock
+
+    with _ast_lock:
+        if _ast_model is not None:
+            logger.info("ast_using_cached_instance")
+            return _ast_model, _ast_feature_extractor, _ast_device
+
+        logger.info("ast_loading_model")
+        
+        # Determine device
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _ast_device = device
+        
+        try:
+            # Load pre-trained AST model from HuggingFace
+            model_name = "MIT/ast-finetuned-audioset-10-10-0.4593"
+            
+            _ast_feature_extractor = ASTFeatureExtractor.from_pretrained(
+                model_name,
+                cache_dir=settings.MODEL_CACHE_DIR,
+            )
+            
+            _ast_model = ASTForAudioClassification.from_pretrained(
+                model_name,
+                cache_dir=settings.MODEL_CACHE_DIR,
+            )
+            
+            _ast_model.to(device)
+            _ast_model.eval()
+            
+            logger.info(
+                "ast_model_loaded",
+                model=model_name,
+                device=device,
+                num_labels=_ast_model.config.num_labels,
+            )
+            
+        except Exception as e:
+            logger.error("ast_model_load_failed", error=str(e))
+            raise RuntimeError(
+                f"Failed to load AST model. Ensure transformers and torch are installed. Error: {e}"
+            ) from e
+        
+        return _ast_model, _ast_feature_extractor, _ast_device
 
 
 def run_prediction(
@@ -143,9 +221,19 @@ def run_prediction(
     """
     logger.info("prediction_pipeline_start", drums_path=drums_path)
 
-    # Load drum track
-    drum_track, sr = librosa.load(drums_path, sr=None, mono=True)
-    duration = librosa.get_duration(y=drum_track, sr=sr)
+    # Load drum track using torchaudio (keeps data as tensors)
+    drum_track_tensor, sr = torchaudio.load(drums_path)
+    
+    # Convert to mono via tensor operations
+    if drum_track_tensor.shape[0] > 1:
+        drum_track_tensor = drum_track_tensor.mean(dim=0, keepdim=True)
+    
+    # Calculate duration from tensor shape
+    duration = drum_track_tensor.shape[1] / sr
+    
+    # Convert to NumPy only for BPM detection (madmom requires NumPy)
+    drum_track_np = drum_track_tensor.squeeze(0).numpy()
+    sr = int(sr)
 
     # --- BPM Detection ---
     bpm_unreliable = False
@@ -153,19 +241,21 @@ def run_prediction(
         detected_bpm = float(user_bpm)
         logger.info("bpm_user_supplied", bpm=detected_bpm)
     else:
-        detected_bpm, bpm_unreliable = _detect_bpm(drum_track, sr)
+        detected_bpm, bpm_unreliable = _detect_bpm(drum_track_np, sr)
 
-    # --- Onset Detection & Frame Extraction ---
-    # Replicate AnNOTEator's drum_to_frame logic
+    # --- Phase 4: PyTorch-Native Onset Detection ---
+    # Replicate AnNOTEator's drum_to_frame logic with PyTorch tensors
     hop_length = 1024
     if detected_bpm > 110:
         hop_length = 512
 
-    o_env = librosa.onset.onset_strength(y=drum_track, sr=sr, hop_length=hop_length)
-    onset_frames = librosa.onset.onset_detect(
-        y=drum_track, onset_envelope=o_env, sr=sr, hop_length=hop_length
+    # Detect onsets using PyTorch-native spectral flux method
+    onset_samples = _detect_onsets_pytorch(
+        drum_track_tensor.squeeze(0),
+        sr,
+        hop_length=hop_length,
+        sensitivity=settings.ONSET_SENSITIVITY
     )
-    onset_samples = librosa.frames_to_samples(onset_frames, hop_length=hop_length)
 
     if len(onset_samples) == 0:
         logger.warning("no_onsets_detected", drums_path=drums_path)
@@ -178,36 +268,56 @@ def run_prediction(
             "hits": [],
         }
 
+    logger.info(
+        "onsets_detected_pytorch",
+        total_onsets=len(onset_samples),
+        sensitivity=settings.ONSET_SENSITIVITY
+    )
+
     # Calculate window size based on 16th note duration (AnNOTEator default resolution=16)
     sixteenth_duration = 60 / detected_bpm / 4
     thirty_second_duration = 60 / detected_bpm / 8
-    window_size = librosa.time_to_samples(sixteenth_duration, sr=sr)
-    padding = librosa.time_to_samples(thirty_second_duration / 4, sr=sr)
+    window_size = int(sixteenth_duration * sr)
+    padding = int(thirty_second_duration / 4 * sr)
 
     # Extract audio clips for each onset
     TARGET_LENGTH = 8820  # AnNOTEator's fixed frame size
     clips = []
     valid_onset_times = []
 
+    # Convert tensor to NumPy for clip extraction (required for compatibility)
+    drum_track_np_full = drum_track_tensor.squeeze(0).numpy()
+    
     for onset in onset_samples:
         start = max(0, int(onset - padding))
         end = int(onset + window_size)
-        clip = drum_track[start:end]
+        clip = drum_track_np_full[start:end]
 
         if len(clip) == 0:
             continue
 
-        # Resample to target length (AnNOTEator requirement)
+        # Resample to target length using tensor operations (avoid librosa)
         if len(clip) != TARGET_LENGTH:
+            # Convert clip to tensor for resampling
+            clip_tensor = torch.from_numpy(clip).unsqueeze(0)  # Add channel dim
+            
+            # Use torchaudio's Resample transform
             ratio = TARGET_LENGTH / len(clip)
-            clip = librosa.resample(clip, orig_sr=sr, target_sr=int(sr * ratio))
-            if len(clip) > TARGET_LENGTH:
-                clip = clip[:TARGET_LENGTH]
-            elif len(clip) < TARGET_LENGTH:
-                clip = np.pad(clip, (0, TARGET_LENGTH - len(clip)))
+            target_sr_temp = int(sr * ratio)
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr_temp)
+            clip_resampled = resampler(clip_tensor).squeeze(0)
+            
+            # Ensure exact target length via padding/truncation
+            if clip_resampled.shape[0] > TARGET_LENGTH:
+                clip = clip_resampled[:TARGET_LENGTH].numpy()
+            elif clip_resampled.shape[0] < TARGET_LENGTH:
+                padding = TARGET_LENGTH - clip_resampled.shape[0]
+                clip = torch.nn.functional.pad(clip_resampled, (0, padding)).numpy()
+            else:
+                clip = clip_resampled.numpy()
 
         clips.append(clip)
-        valid_onset_times.append(librosa.samples_to_time(onset, sr=sr))
+        valid_onset_times.append(onset / sr)  # Convert samples to seconds
 
     if len(clips) == 0:
         return {
@@ -219,59 +329,113 @@ def run_prediction(
             "hits": [],
         }
 
-    # --- Mel-Spectrogram Feature Extraction + Mini-batch CNN Inference ---
-    # Process in batches of CNN_BATCH_SIZE to keep peak RAM bounded regardless
-    # of track length (avoids OOM on dense long-form audio).
-    CNN_BATCH_SIZE = 256
+    # --- AST-Based Hit Classification ---
+    # Process in batches to keep peak RAM bounded
+    AST_BATCH_SIZE = 32  # Transformers are more memory-intensive than CNNs
 
-    from app.ml.registry import get_model_resolver
-    resolver = get_model_resolver()
+    # Load AST model
     try:
-        model = resolver.get_keras_model()
-    except (FileNotFoundError, Exception) as e:
+        model, feature_extractor, device = _load_ast_model()
+    except Exception as e:
         logger.error(
-            "cnn_model_unavailable",
+            "ast_model_unavailable",
             error=str(e),
-            message="CNN model not found. Ensure complete_network.h5 is in ./inference/pretrained_models/annoteators/"
+            message="AST model failed to load. Ensure transformers and torch are installed."
         )
         raise RuntimeError(
             "Hit classification model not available. "
-            "Place complete_network.h5 in ./inference/pretrained_models/annoteators/ and restart workers."
+            "AST model could not be loaded. Check worker logs for details."
         ) from e
 
-    all_preds: list = []
-    for batch_start in range(0, len(clips), CNN_BATCH_SIZE):
-        batch_clips = clips[batch_start : batch_start + CNN_BATCH_SIZE]
-        batch_mels = []
-        for clip in batch_clips:
-            mel = librosa.feature.melspectrogram(
-                y=clip, sr=sr, n_fft=MEL_N_FFT, hop_length=MEL_HOP_LENGTH,
-                n_mels=MEL_N_MELS, fmax=MEL_FMAX, power=MEL_POWER,
-            )
-            batch_mels.append(mel)
-        X_batch = np.array(batch_mels).reshape(len(batch_mels), MEL_N_MELS, -1, 1)
-        all_preds.append(model.predict(X_batch, verbose=0))
-        del batch_mels, X_batch
+    # AST expects 16kHz audio - resample using torchaudio if necessary
+    target_sr = 16000
+    if sr != target_sr:
+        logger.info("ast_resampling_audio", original_sr=sr, target_sr=target_sr)
+        
+        # Use torchaudio Resample transform (GPU-compatible)
+        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr)
+        clips_resampled = []
+        
+        for clip in clips:
+            # Convert to tensor, resample, convert back to NumPy for feature extractor
+            clip_tensor = torch.from_numpy(clip).unsqueeze(0)
+            clip_resampled_tensor = resampler(clip_tensor).squeeze(0)
+            clips_resampled.append(clip_resampled_tensor.numpy())
+        
+        clips = clips_resampled
+        sr = target_sr
+
+    # Process clips in batches through AST
+    all_predictions = []
+    
+    for batch_start in range(0, len(clips), AST_BATCH_SIZE):
+        batch_clips = clips[batch_start : batch_start + AST_BATCH_SIZE]
+        
+        # Prepare inputs using feature extractor
+        inputs = feature_extractor(
+            batch_clips,
+            sampling_rate=sr,
+            return_tensors="pt",
+            padding=True,
+        )
+        
+        # Move to device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # Run inference
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits
+            # Apply sigmoid for multi-label classification (one onset can have multiple drums)
+            probs = torch.sigmoid(logits).cpu().numpy()
+        
+        all_predictions.append(probs)
+        
+        del inputs, outputs, logits
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
     # Free raw audio and clips — no longer needed
     del drum_track, clips, o_env, onset_frames, onset_samples
 
-    pred_raw = np.concatenate(all_preds, axis=0)
-    del all_preds
-    pred_rounded = np.round(pred_raw)
+    # Concatenate all batch predictions
+    pred_raw = np.concatenate(all_predictions, axis=0)
+    del all_predictions
 
-    # AnNOTEator logic: if all zeros, pick argmax
+    # Map AudioSet predictions to drum instruments
+    # Get model's label mapping
+    id2label = model.config.id2label
+    
+    # For each onset, extract drum hits based on confidence threshold
+    CONFIDENCE_THRESHOLD = 0.3
     results = []
+    
     for i in range(pred_raw.shape[0]):
-        prediction = pred_rounded[i]
-        if prediction.sum() == 0:
-            raw = pred_raw[i]
-            new = np.zeros(len(ANNOTEATOR_CLASSES))
-            new[raw.argmax()] = 1
-            results.append(new)
-        else:
-            results.append(prediction)
-
+        onset_probs = pred_raw[i]
+        onset_hits = {inst: 0.0 for inst in ANNOTEATOR_CLASSES}
+        
+        # Get top predictions above threshold
+        top_indices = np.where(onset_probs > CONFIDENCE_THRESHOLD)[0]
+        
+        for idx in top_indices:
+            label = id2label.get(idx, "Unknown")
+            confidence = onset_probs[idx]
+            
+            # Map AudioSet label to drum instrument
+            drum_instrument = None
+            for audioset_label, drum_name in AUDIOSET_TO_DRUM_MAP.items():
+                if audioset_label.lower() in label.lower():
+                    drum_instrument = drum_name
+                    break
+            
+            # Update with highest confidence for each instrument
+            if drum_instrument and confidence > onset_hits[drum_instrument]:
+                onset_hits[drum_instrument] = confidence
+        
+        # Convert to binary array format (compatible with existing code)
+        onset_result = np.array([onset_hits[inst] for inst in ANNOTEATOR_CLASSES])
+        results.append(onset_result)
+    
     results = np.array(results)
 
     # --- Build hits list and summary ---
@@ -280,12 +444,13 @@ def run_prediction(
 
     for i, onset_time in enumerate(valid_onset_times):
         for j, instrument in enumerate(ANNOTEATOR_CLASSES):
-            if results[i][j] == 1:
-                velocity = float(pred_raw[i][j])
+            # AST outputs confidence values (0.0-1.0), not binary
+            confidence = results[i][j]
+            if confidence > 0.0:  # Only include detected instruments
                 hits.append({
                     "time": round(float(onset_time), 4),
                     "instrument": instrument,
-                    "velocity": round(velocity, 4),
+                    "velocity": round(confidence, 4),
                 })
                 hit_counts[instrument] += 1
 
@@ -293,9 +458,19 @@ def run_prediction(
     hit_summary = {k: v for k, v in hit_counts.items() if v > 0}
 
     # --- Confidence Scoring ---
-    mean_confidence = float(np.mean(pred_raw.max(axis=1)))
-    min_confidence = float(np.min(pred_raw.max(axis=1)))
-    confidence_score = round(mean_confidence, 4)
+    # For multi-label predictions, use mean of all positive predictions
+    positive_confidences = results[results > 0.0]
+    if len(positive_confidences) > 0:
+        mean_confidence = float(np.mean(positive_confidences))
+        confidence_score = round(mean_confidence, 4)
+    else:
+        confidence_score = 0.0
+
+    # Memory cleanup
+    del pred_raw, results
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     logger.info(
         "prediction_complete",
@@ -305,7 +480,8 @@ def run_prediction(
         confidence=confidence_score,
     )
 
-    return {
+    # Build raw prediction dict
+    raw_prediction = {
         "detected_bpm": int(detected_bpm),
         "bpm_unreliable": bpm_unreliable,
         "duration_seconds": round(duration, 2),
@@ -313,6 +489,25 @@ def run_prediction(
         "hit_summary": hit_summary,
         "hits": hits,
     }
+
+    # Validate output against Pydantic schema before returning
+    # This catches any schema violations early (e.g., unsorted hits, invalid BPM)
+    try:
+        validated = PredictionResult.model_validate(raw_prediction)
+        logger.info(
+            "prediction_validated",
+            schema_version=validated.schema_version,
+            model_version=validated.model_version,
+        )
+        # Return as dict for backward compatibility with worker.py
+        return validated.model_dump()
+    except Exception as e:
+        logger.error(
+            "prediction_validation_failed",
+            error=str(e),
+            message="ML output failed Pydantic validation - this indicates a bug in the pipeline"
+        )
+        raise RuntimeError(f"Prediction output validation failed: {e}") from e
 
 
 def _detect_bpm(drum_track: np.ndarray, sr: int) -> tuple[float, bool]:

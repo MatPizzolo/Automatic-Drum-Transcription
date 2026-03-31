@@ -269,7 +269,7 @@ def separate_drums(self, job_id: str) -> str:
         _update_job(job_id, status="separating_drums", progress=20)
         _publish_status(job_id, "separating_drums", 20)
         logger.info("separation_start", job_id=job_id)
-        _log_memory_usage(logger, "demucs_memory_before")
+        _log_memory_usage(logger, "separator_memory_before")
 
         job_dir = storage.get_job_dir(job_id)
         drums_path = Path(storage.get_file_path(job_id, "drums.wav"))
@@ -283,12 +283,12 @@ def separate_drums(self, job_id: str) -> str:
             if not audio_files:
                 raise FileNotFoundError(f"No source audio in {job_dir}")
             
-            logger.info("starting_demucs_separation", input_file=str(audio_files[0]))
+            logger.info("starting_separator_separation", input_file=str(audio_files[0]))
             run_drum_separation(str(audio_files[0]), str(drums_path))
-            _log_memory_usage(logger, "demucs_separation_complete_memory")
+            _log_memory_usage(logger, "separator_separation_complete_memory")
 
         gc.collect()
-        _log_memory_usage(logger, "demucs_cleanup_memory")
+        _log_memory_usage(logger, "separator_cleanup_memory")
 
         elapsed = int((time.monotonic() - start) * 1000)
         INFERENCE_LATENCY.labels(stage="separation").observe(elapsed / 1000)
@@ -340,8 +340,72 @@ def predict_hits(self, job_id: str) -> str:
             logger.info("using_user_supplied_bpm", bpm=user_bpm)
 
         from app.ml.engine import run_prediction
-        logger.info("starting_cnn_inference", drums_path=drums_path)
-        result = run_prediction(drums_path, user_bpm=user_bpm)
+        from app.ml.guardrails import apply_ml_guardrails
+        from app.schemas.ml_contracts import PredictionResult
+        import json
+        
+        # Phase 3: Idempotency check - skip expensive GPU inference if hits.json exists
+        hits_path = storage.get_file_path(job_id, "hits.json")
+        result = None
+        
+        if storage.file_exists(hits_path):
+            logger.info(
+                "idempotency_check_found_existing_hits",
+                job_id=job_id,
+                hits_path=hits_path
+            )
+            try:
+                # Attempt to load and validate existing hits.json
+                hits_json = storage.read_file(hits_path)
+                existing_data = json.loads(hits_json)
+                
+                # Validate against Pydantic schema (ensures data integrity)
+                validated = PredictionResult.model_validate(existing_data)
+                
+                # Convert back to dict for compatibility with rest of pipeline
+                result = validated.model_dump()
+                
+                logger.info(
+                    "prediction_skipped_existing",
+                    job_id=job_id,
+                    schema_version=result.get("schema_version"),
+                    model_version=result.get("model_version"),
+                    total_hits=len(result.get("hits", [])),
+                    message="Reusing existing prediction results (idempotent retry)"
+                )
+            except (json.JSONDecodeError, ValueError, Exception) as e:
+                # Corrupted or invalid hits.json - fall back to re-running prediction
+                logger.warning(
+                    "idempotency_validation_failed",
+                    job_id=job_id,
+                    error=str(e),
+                    message="Existing hits.json is corrupted or invalid, re-running prediction"
+                )
+                result = None
+        
+        # Run prediction if no valid cached result exists
+        if result is None:
+            # Use Modal serverless GPU if enabled, otherwise run locally
+            if settings.USE_MODAL:
+                logger.info("starting_modal_inference", drums_path=drums_path)
+                from app.ml.modal_client import get_modal_client
+                
+                modal_client = get_modal_client()
+                result = modal_client.process_audio(
+                    audio_path=drums_path,
+                    user_bpm=user_bpm,
+                )
+                # Modal already applies guardrails internally
+            else:
+                logger.info("starting_local_inference", drums_path=drums_path)
+                result = run_prediction(drums_path, user_bpm=user_bpm)
+                
+                # Apply ML guardrails before saving/transcription
+                # This prevents catastrophic failures from BPM hallucinations, 
+                # impossible polyphony, and low-confidence noise
+                logger.info("applying_ml_guardrails")
+                result = apply_ml_guardrails(result)
+        
         _log_memory_usage(logger, "cnn_prediction_complete_memory")
         
         # Log prediction results
@@ -354,7 +418,7 @@ def predict_hits(self, job_id: str) -> str:
             confidence_score=result.get("confidence_score"),
         )
 
-        # Save prediction results to job
+        # Save prediction results to job (including schema/model versions)
         warnings = []
         if result.get("bpm_unreliable", False):
             warnings.append("bpm_unreliable")
@@ -372,10 +436,16 @@ def predict_hits(self, job_id: str) -> str:
             progress=75,
         )
 
-        # Save raw hits data as JSON for the result endpoint
-        import json
-        hits_data = json.dumps(result.get("hits", [])).encode()
+        # Phase 3: Save complete prediction result with schema versioning
+        # This includes schema_version and model_version for future compatibility
+        hits_data = json.dumps(result, indent=2).encode()
         storage.save_file(job_id, "hits.json", hits_data)
+        
+        logger.info(
+            "prediction_saved_with_versioning",
+            schema_version=result.get("schema_version"),
+            model_version=result.get("model_version")
+        )
 
         gc.collect()
         _log_memory_usage(logger, "cnn_cleanup_memory")
@@ -399,7 +469,7 @@ def predict_hits(self, job_id: str) -> str:
 
 @celery_app.task(name="app.worker.transcribe_and_export")
 def transcribe_and_export(job_id: str) -> str:
-    """Transcription (music21) + MusicXML/PDF export."""
+    """Transcription (symusic) + MusicXML/PDF export."""
     import structlog
     logger = structlog.get_logger("task.transcribe_export")
     start = time.monotonic()
@@ -424,19 +494,20 @@ def transcribe_and_export(job_id: str) -> str:
         if not storage.file_exists(hits_path):
             raise FileNotFoundError(f"Hits data not found: {hits_path}")
 
-        hits = json.loads(storage.read_file(hits_path))
+        prediction_data = json.loads(storage.read_file(hits_path))
+        hits = prediction_data.get("hits", []) if isinstance(prediction_data, dict) else prediction_data
         detected_bpm = _get_job_field(job_id, "detected_bpm") or 120
         title = _get_job_field(job_id, "title") or "Untitled"
         
         logger.info("building_sheet_music", total_hits=len(hits), bpm=detected_bpm, title=title)
 
-        # Build sheet music
-        music21_stream = build_sheet_music(hits, detected_bpm, title)
+        # Build sheet music using symusic
+        symusic_score = build_sheet_music(hits, detected_bpm, title)
         logger.info("sheet_music_built")
 
         # Export MusicXML
         musicxml_path = storage.get_file_path(job_id, "sheet_music.musicxml")
-        export_musicxml(music21_stream, musicxml_path)
+        export_musicxml(symusic_score, musicxml_path)
         logger.info("musicxml_exported", path=musicxml_path)
 
         # Export PDF (may fail if MuseScore not installed — graceful degradation)
@@ -472,7 +543,7 @@ def transcribe_and_export(job_id: str) -> str:
 
         _update_job(job_id, **update_fields)
 
-        del music21_stream, hits
+        del symusic_score, hits
         gc.collect()
 
         INFERENCE_LATENCY.labels(stage="transcription").observe(elapsed / 1000)
