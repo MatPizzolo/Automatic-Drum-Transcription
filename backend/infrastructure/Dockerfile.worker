@@ -1,14 +1,16 @@
 # syntax=docker/dockerfile:1
+# Celery worker image — full local stack or self-hosted production.
+# Runs drum separation (BS-Roformer via audio-separator) and
+# hit detection (AST via transformers) as Celery tasks.
 
-# ---- build stage: install deps with build tools ----
+# ---- build stage ----
 FROM python:3.11-slim@sha256:0b23cfb7425d065008b778022a17b1551c82f8b4866ee5a7a200084b7e2eafbf AS builder
 
-# Build tools for compiled extensions:
-#   gcc/g++         — C/C++ extensions (numpy, soundfile, psutil)
-#   libpq-dev       — psycopg2 headers
-#   libsndfile1-dev — soundfile wheel
-#   libffi-dev      — cffi/cryptography wheels
-#   cmake           — some torch sub-deps
+# gcc/g++         — C/C++ extensions (numpy, soundfile, psutil)
+# libpq-dev       — psycopg2-binary headers
+# libsndfile1-dev — soundfile native extension
+# libffi-dev      — cffi / cryptography wheels
+# cmake           — required by some torch sub-dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ libpq-dev libsndfile1-dev libffi-dev cmake \
     && rm -rf /var/lib/apt/lists/*
@@ -16,73 +18,51 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY requirements-api.txt requirements-worker.txt ./
 
-# ── Tier 0 ───────────────────────────────────────────────────────────────
-# Upgrade installer chain for PEP 517/518 support.
-# Install to system site-packages (NO --prefix) so every subsequent pip
-# invocation in this stage sees the same resolved environment.
+# Install CPU-only torch/torchaudio first to avoid pulling the full NVIDIA
+# CUDA stack (~2-4 GB) that pip selects by default on linux/arm64.
+# pip sees torch already satisfied when it processes requirements-worker.txt.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --upgrade pip setuptools wheel
+    pip install --upgrade pip setuptools wheel && \
+    pip install --index-url https://download.pytorch.org/whl/cpu \
+        "torch>=2.0.0,<3.0.0" "torchaudio>=2.0.0" && \
+    pip install -r requirements-worker.txt
 
-# ── Tier 1 ───────────────────────────────────────────────────────────────
-# Pre-install build-time deps that madmom's setup.py imports at *metadata*
-# collection time (before pip starts the actual build).
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "Cython>=3.0.0,<4" "numpy==1.26.4"
-
-# ── Tier 2 ───────────────────────────────────────────────────────────────
-# Install ALL non-madmom requirements with full build isolation (default).
-# This guarantees pip resolves the complete transitive dep tree, including
-# packaging (required by kombu/celery[redis]).
-RUN --mount=type=cache,target=/root/.cache/pip \
-    grep -v '^madmom' requirements-worker.txt > req-no-madmom.txt && \
-    pip install -r req-no-madmom.txt
-
-# ── Tier 3 ───────────────────────────────────────────────────────────────
-# Install madmom alone with --no-build-isolation so its legacy setup.py
-# can import numpy + Cython already present from Tier 1.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-build-isolation "madmom==0.16.1"
-
-# ---- runtime stage: slim image with audio/PDF tooling ----
+# ---- runtime stage ----
 FROM python:3.11-slim@sha256:0b23cfb7425d065008b778022a17b1551c82f8b4866ee5a7a200084b7e2eafbf
 
 LABEL org.opencontainers.image.title="drumscribe-worker" \
-      org.opencontainers.image.description="DrumScribe Celery worker (Demucs, CNN inference)" \
+      org.opencontainers.image.description="DrumScribe Celery worker: drum separation (BS-Roformer) + hit detection (AST)" \
       org.opencontainers.image.version="0.1.0"
 
-# Runtime shared libs: libpq5 (asyncpg), libsndfile1 (soundfile), ffmpeg (demucs/librosa),
-# lilypond (PDF export), curl (healthcheck)
+# libpq5      — asyncpg / psycopg2 runtime
+# libsndfile1 — soundfile audio I/O
+# ffmpeg      — audio decoding (librosa / torchaudio)
+# lilypond    — PDF sheet music export
+# curl        — healthcheck probe
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq5 ffmpeg libsndfile1 curl lilypond \
+    libpq5 libsndfile1 ffmpeg lilypond curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed packages from builder's system Python.
-# We installed directly to system site-packages (no --prefix) so we copy
-# those paths explicitly — this is correct and complete with no prefix merge.
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 RUN useradd -r -m -s /usr/sbin/nologin -u 1001 appuser
-
 WORKDIR /app
 COPY --chown=appuser:appuser . .
 
-# Optional: Copy local models if inference/ directory exists (local dev)
-# In production, models are downloaded at runtime via MODEL_URI
 RUN mkdir -p /data/artifacts /data/models /tmp/celery \
     && chown -R appuser:appuser /data /tmp/celery \
-    && if [ -d "/app/inference" ]; then \
-         echo "Local models found in /app/inference — will be available as fallback"; \
-       fi
-
-# Make entrypoint executable
-RUN chmod +x /app/scripts/entrypoint-worker.sh /app/scripts/download_models.sh
+    && chmod +x /app/scripts/entrypoint-worker.sh /app/scripts/download_models.sh
 
 USER appuser
 
-# Explicit signal for graceful Celery shutdown
+ENV MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache
+
+# Allow Celery to shut down gracefully before Docker kills the container.
 STOPSIGNAL SIGTERM
 
+# Longer start period: worker preloads ML models before serving tasks.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD celery -A app.worker inspect ping --timeout=5 || exit 1
 

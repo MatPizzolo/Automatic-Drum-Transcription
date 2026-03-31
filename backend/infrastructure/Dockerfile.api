@@ -1,34 +1,37 @@
 # syntax=docker/dockerfile:1
+# Production API image — deployed to Fly.io.
+# No ML dependencies; all inference is delegated to Modal serverless GPUs.
 
-# ---- build stage: install deps with build tools ----
+# ---- build stage ----
 FROM python:3.11-slim@sha256:0b23cfb7425d065008b778022a17b1551c82f8b4866ee5a7a200084b7e2eafbf AS builder
 
-# libffi-dev — cffi/cryptography wheels; libpq-dev — psycopg2
+# gcc/g++ — C extensions (psutil, cryptography)
+# libpq-dev — psycopg2-binary headers
+# libffi-dev — cffi / cryptography wheels
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ libpq-dev libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY requirements-api.txt ./requirements.txt
+COPY requirements-api.txt ./
 
-# Upgrade installer chain first, then install to system site-packages (no --prefix)
-# so the full transitive dep tree (including packaging, kombu sub-deps) is resolved.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel && \
-    pip install -r requirements.txt
+    pip install -r requirements-api.txt
 
-# ---- runtime stage: slim image, no compiler ----
+# ---- runtime stage ----
 FROM python:3.11-slim@sha256:0b23cfb7425d065008b778022a17b1551c82f8b4866ee5a7a200084b7e2eafbf
 
 LABEL org.opencontainers.image.title="drumscribe-api" \
-      org.opencontainers.image.description="DrumScribe FastAPI backend" \
+      org.opencontainers.image.description="DrumScribe FastAPI backend — job orchestration, dispatches ML work to Modal" \
       org.opencontainers.image.version="0.1.0"
 
+# libpq5 — asyncpg / psycopg2 runtime
+# curl   — Docker healthcheck
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy from builder's system site-packages (no prefix merge needed)
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
@@ -37,12 +40,14 @@ WORKDIR /app
 COPY --chown=appuser:appuser . .
 
 RUN mkdir -p /data/artifacts /data/models \
-    && chown -R appuser:appuser /data
+    && chown -R appuser:appuser /data \
+    && chmod +x /app/scripts/entrypoint-api.sh
 
 USER appuser
 EXPOSE 8000
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8000/api/v1/health || exit 1
+    CMD curl -f http://localhost:8000/api/health || exit 1
 
+ENTRYPOINT ["/app/scripts/entrypoint-api.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

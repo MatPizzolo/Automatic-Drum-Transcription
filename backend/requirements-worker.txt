@@ -7,7 +7,7 @@ soundfile==0.13.1
 numpy==1.26.4
 
 # ML Pipeline - Drum Separation
-audio-separator[gpu]==0.22.2
+audio-separator[cpu]==0.22.2
 
 # ML Pipeline - Transformer-based Hit Detection
 torch>=2.0.0,<3.0.0

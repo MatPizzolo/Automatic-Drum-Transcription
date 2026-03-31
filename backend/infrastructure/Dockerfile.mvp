@@ -1,14 +1,16 @@
 # syntax=docker/dockerfile:1
+# MVP all-in-one image — local development only.
+# Runs FastAPI + full ML pipeline in a single process (USE_CELERY=false).
+# No Celery or Redis required.
 
-# ---- build stage: install deps with build tools ----
+# ---- build stage ----
 FROM python:3.11-slim@sha256:0b23cfb7425d065008b778022a17b1551c82f8b4866ee5a7a200084b7e2eafbf AS builder
 
-# Build tools for compiled extensions:
-#   gcc/g++         — C/C++ extensions (numpy, soundfile, psutil)
-#   libpq-dev       — psycopg2 headers
-#   libsndfile1-dev — soundfile wheel
-#   libffi-dev      — cffi/cryptography wheels
-#   cmake           — some torch sub-deps
+# gcc/g++         — C/C++ extensions (numpy, soundfile, psutil)
+# libpq-dev       — psycopg2-binary headers
+# libsndfile1-dev — soundfile native extension
+# libffi-dev      — cffi / cryptography wheels
+# cmake           — required by some torch sub-dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ libpq-dev libsndfile1-dev libffi-dev cmake \
     && rm -rf /var/lib/apt/lists/*
@@ -16,49 +18,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY requirements-api.txt requirements-worker.txt ./
 
-# ── Tier 0 ───────────────────────────────────────────────────────────────
-# Upgrade installer chain for PEP 517/518 support.
-# Install to system site-packages (NO --prefix) so every subsequent pip
-# invocation in this stage sees the same resolved environment.
+# Install CPU-only torch/torchaudio first to avoid pulling the full NVIDIA
+# CUDA stack (~2-4 GB) that pip selects by default on linux/arm64.
+# pip sees torch already satisfied when it processes requirements-worker.txt.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --upgrade pip setuptools wheel
+    pip install --upgrade pip setuptools wheel && \
+    pip install --index-url https://download.pytorch.org/whl/cpu \
+        "torch>=2.0.0,<3.0.0" "torchaudio>=2.0.0" && \
+    pip install -r requirements-worker.txt
 
-# ── Tier 1 ───────────────────────────────────────────────────────────────
-# Pre-install build-time deps that madmom's setup.py imports at *metadata*
-# collection time (before pip starts the actual build).
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "Cython>=3.0.0,<4" "numpy==1.26.4"
-
-# ── Tier 2 ───────────────────────────────────────────────────────────────
-# Install ALL non-madmom requirements with full build isolation (default).
-# This guarantees pip resolves the complete transitive dep tree, including
-# packaging (required by kombu/celery[redis]).
-RUN --mount=type=cache,target=/root/.cache/pip \
-    grep -v '^madmom' requirements-worker.txt > req-no-madmom.txt && \
-    pip install -r req-no-madmom.txt
-
-# ── Tier 3 ───────────────────────────────────────────────────────────────
-# Install madmom alone with --no-build-isolation so its legacy setup.py
-# can import numpy + Cython already present from Tier 1.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-build-isolation "madmom==0.16.1"
-
-# ---- runtime stage: slim image with audio/PDF tooling ----
+# ---- runtime stage ----
 FROM python:3.11-slim@sha256:0b23cfb7425d065008b778022a17b1551c82f8b4866ee5a7a200084b7e2eafbf
 
-LABEL org.opencontainers.image.title="drumscribe-api-mvp" \
-      org.opencontainers.image.description="DrumScribe FastAPI backend with embedded ML pipeline (MVP mode)" \
+LABEL org.opencontainers.image.title="drumscribe-mvp" \
+      org.opencontainers.image.description="DrumScribe all-in-one: FastAPI + ML pipeline in-process (USE_CELERY=false)" \
       org.opencontainers.image.version="0.1.0"
 
-# Runtime shared libs: libpq5 (asyncpg), libsndfile1 (soundfile), ffmpeg (demucs/librosa),
-# lilypond (PDF export), curl (healthcheck)
+# libpq5      — asyncpg / psycopg2 runtime
+# libsndfile1 — soundfile audio I/O
+# ffmpeg      — audio decoding (librosa / torchaudio)
+# lilypond    — PDF sheet music export
+# curl        — Docker healthcheck
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq5 ffmpeg libsndfile1 curl lilypond \
+    libpq5 libsndfile1 ffmpeg lilypond curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed packages from builder's system Python.
-# We installed directly to system site-packages (no --prefix) so we copy
-# those paths explicitly — this is correct and complete with no prefix merge.
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
@@ -67,18 +51,19 @@ WORKDIR /app
 COPY --chown=appuser:appuser . .
 
 RUN mkdir -p /data/artifacts /data/models /tmp/matplotlib \
-    && chown -R appuser:appuser /data /tmp/matplotlib
-
-RUN chmod +x /app/scripts/entrypoint-api.sh
+    && chown -R appuser:appuser /data /tmp/matplotlib \
+    && chmod +x /app/scripts/entrypoint-api.sh
 
 USER appuser
 
-# Set matplotlib config directory to writable location to avoid warnings
-ENV MPLCONFIGDIR=/tmp/matplotlib
+ENV USE_CELERY=false \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+# Longer start period: first run downloads ML models at startup.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=120s --retries=5 \
     CMD curl -f http://localhost:8000/api/health || exit 1
 
 ENTRYPOINT ["/app/scripts/entrypoint-api.sh"]
