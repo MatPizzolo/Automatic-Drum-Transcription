@@ -9,6 +9,9 @@ from unittest.mock import patch
 
 import pytest
 
+# engine.py imports torch at module level — skip if not installed
+pytest.importorskip("torch")
+
 # Pre-import so mock.patch("app.ml.engine.*") can resolve the attribute path
 import app.ml.engine  # noqa: F401
 
