@@ -143,7 +143,7 @@ jobs:
           tags: drumscribe-${{ matrix.name }}:scan
           cache-from: type=gha,scope=${{ matrix.name }}
       - name: Trivy scan (${{ matrix.name }})
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: drumscribe-${{ matrix.name }}:scan
           severity: HIGH,CRITICAL
