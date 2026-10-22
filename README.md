@@ -1,78 +1,88 @@
-# CDrumscribe — Technical Specification & Infrastructure
+[![Español](https://img.shields.io/badge/lang-Espa%C3%B1ol-blue)](README.es.md)
 
-> **Converting physical percussion into structured digital notation** — the hardest signal processing problem in music AI, solved end-to-end.
+# CDrumscribe — Automatic Drum Transcription
+
+> **CDrumscribe** is the project name. The repository is `Automatic-Drum-Transcription`, and the code, containers and API title use the working name `DrumScribe`. All three refer to the same project.
+
+CDrumscribe takes a song (an audio upload or a YouTube URL), separates the source audio, detects drum onsets, labels each onset with a pretrained audio classifier, and quantizes the hits into a drum score (MusicXML, plus a PDF engraved with LilyPond). It runs as a FastAPI backend with a Next.js frontend, in two modes: a single-container MVP and a Celery-based multi-worker stack.
 
 <div align="center">
 
-| Signal Acquisition | DSP Layer | ML Inference | Structured Output |
+| Ingestion | Separation | Onsets + classification | Output |
 |---|---|---|---|
-| Audio Buffer / YouTube | STFT → Spectral Flux | BS-Roformer + AST | MusicXML / PDF |
+| Upload / YouTube (yt-dlp) | BS-Roformer via `audio-separator` | STFT spectral flux → AST (AudioSet) | symusic score → MusicXML / PDF |
 
 </div>
 
 ---
 
-## Executive Summary
+## Project Status
 
-Drum transcription is an unsolved physical-to-digital challenge: unlike pitched instruments, percussion produces broadband, transient, polyphonic signals with no harmonic content — standard onset detection fails, pitch-based models are blind, and the ground truth is a 2D notation system with strict temporal quantization constraints. CDrumscribe is a production-grade MLOps pipeline that solves this in four discrete, independently-scalable stages: source separation, onset detection, instrument classification, and symbolic music export.
+This is a personal project. Here is where it stands, checked against the code on 2026-10-22:
+
+- **Works:** the MVP stack (`docker-compose.mvp.yml`) builds from a fresh clone and comes up healthy. The API (`/docs`, `/api/health`) and the frontend respond.
+- **Known issues in the current images** (details and fixes are tracked separately from this README):
+  - `torchvision` gets pulled from PyPI next to the CPU-only `torch`, so `transformers` cannot import the AST model and jobs fail at the separation stage. Installing `torchvision` from the PyTorch CPU index gets past this error (tested locally).
+  - The separation checkpoint `model_bs_roformer_ep_368_sdr_12.9628.ckpt` is a **vocals/instrumental** model (per its `audio-separator` config). Its 12.96 dB SDR is a vocals score, not a drum score. The code asks for a `Drums` stem, so the stage ends with `Separator did not produce drums output`. It needs a drum-capable separation model.
+  - `symusic` 0.6 has no MusicXML writer. The code falls back to MIDI → `music21`, and `music21` is not installed in the images.
+- **Not evaluated yet:** there is no transcription-accuracy benchmark (e.g. F-measure on ENST-Drums or MDB Drums). That is the main planned next step.
+- **Classifier:** the AST model is the stock AudioSet checkpoint, used zero-shot. Its 527 AudioSet labels are mapped to drum classes by name. It has not been fine-tuned on drum data.
 
 ---
 
 ## System Architecture
 
-Two deployment modes share a single codebase. The production stack fans out inference across three specialized Celery worker tiers; each tier scales independently and the heavy-compute tier can be offloaded to Modal serverless GPUs with `USE_MODAL=true`.
+Both deployment modes share one codebase. In **MVP mode** (`USE_CELERY=false`), the API runs the four stages in-process as a FastAPI background task. In **Celery mode**, the same four functions run as a Celery chain over three queues, each consumed by its own worker service. When `USE_MODAL=true`, the prediction stage calls a Modal function on an NVIDIA T4 instead of running locally.
 
 ```mermaid
 flowchart TB
-    subgraph Ingress["Signal Acquisition"]
-        AB["Audio Input Buffer\n──────────────\nMP3 / WAV / FLAC\nYouTube URL → yt-dlp\nSHA-256 dedup\nMax 50 MB / 3 concurrent"]
-    end
-
-    subgraph DSP["DSP Layer — Fourier Transforms"]
-        STFT["STFT Engine\n──────────────\nn_fft=2048  hop=512–1024\nMagnitude Spectrogram\nSpectral Flux Envelope\nAdaptive Peak Picking\n\ntorchaudio GPU-native tensors"]
-        BPM["BPM Detector\n──────────────\nmadmom RNNBeat (primary)\nlibrosa fallback\nHalf-time guardrail >200 BPM"]
+    subgraph Ingress["Ingestion"]
+        AB["Audio input\n──────────────\nMP3 / WAV / FLAC / OGG\nYouTube URL → yt-dlp\nSHA-256 hash for in-flight dedup\nMax 50 MB · 3 concurrent jobs per client"]
     end
 
     subgraph Sep["Source Separation"]
-        BSR["BS-Roformer\n──────────────\nmodel_bs_roformer_ep_368\nSDR 12.96 dB\nTransformer-based\nFull-mix → drums.wav"]
+        BSR["BS-Roformer (audio-separator)\n──────────────\nmodel_bs_roformer_ep_368\nstereo → mono stem"]
     end
 
-    subgraph Inference["ML Inference Engine"]
-        AST["Audio Spectrogram Transformer\n──────────────\nMIT/ast-finetuned-audioset\n16kHz input  batch=32\nMulti-label sigmoid output\n7 drum classes\nONNX Runtime (2.7x faster)"]
-        GR["ML Guardrails\n──────────────\nPydantic data contracts\nPolyphony cap: 4 hits/10ms\nConfidence filter: >0.15\nVelocity range: [0.0, 1.0]"]
+    subgraph DSP["Onsets + Tempo"]
+        BPM["Tempo\n──────────────\nlibrosa beat tracker\n(madmom RNN if installed)"]
+        STFT["Onset detection\n──────────────\ntorchaudio Spectrogram\nn_fft=2048 · hop 512/1024\nspectral flux · local-max peaks"]
     end
 
-    subgraph Export["Structured Notation Generator"]
-        SYM["symusic (C++ backend)\n──────────────\n16th-note quantization\nBPM-aligned grid snapping\nMusicXML serialization\n10–100x faster than music21"]
-        LP["LilyPond Engraver\n──────────────\nProfessional PDF render\nServer-side, no browser dep"]
+    subgraph Inference["Classification"]
+        AST["Audio Spectrogram Transformer\n──────────────\nMIT/ast-finetuned-audioset-10-10-0.4593\none clip per onset · 16 kHz · batch 32\nsigmoid over 527 AudioSet labels\n→ 7 drum classes"]
+        GR["Guardrails + Pydantic contract\n──────────────\nBPM > 200 → halved\n≤ 4 hits per 10 ms bucket\nvelocity ≥ 0.15\nPredictionResult.model_validate()"]
     end
 
-    subgraph Orchestration["Task Orchestration — Celery + Redis"]
-        WIO["worker-io\nconcurrency=8 / 512MB\nIngestion + YouTube"]
-        WHV["worker-heavy\nconcurrency=1 / 4GB\nBS-Roformer + AST"]
-        WDF["worker-default\nconcurrency=4 / 1GB\nQuantization + Export"]
-        GPU["Modal NVIDIA T4\n<2s cold start\nscale-to-zero\nUSE_MODAL=true"]
+    subgraph Export["Notation"]
+        SYM["symusic Score\n──────────────\n480 ticks/quarter\n16th-note grid quantization\nGM percussion mapping"]
+        LP["LilyPond\n──────────────\nmusicxml2ly → PDF"]
     end
 
-    subgraph Persistence["Persistence Layer"]
-        PG[("PostgreSQL 16\njobs · status · progress\nBPM · content_hash\ncelery_task_id")]
-        R2["Cloudflare R2 / Local FS\naudio.mp3 · drums.wav\nhits.json · sheet_music.pdf"]
+    subgraph Orchestration["Celery mode — Redis broker"]
+        WIO["worker-io\nqueue io · concurrency 8 · 512 MB"]
+        WHV["worker-heavy\nqueue heavy-compute · concurrency 1 · 4 GB"]
+        WDF["worker-default\nqueue default · concurrency 4 · 1 GB"]
+        GPU["Modal function (T4)\nUSE_MODAL=true"]
     end
 
-    AB --> DSP
-    DSP --> Sep
-    Sep --> Inference
-    Inference --> Export
+    subgraph Persistence["Persistence"]
+        PG[("PostgreSQL 16\njob state · progress · BPM\ncontent_hash · celery_task_id")]
+        FS["Local volume (default)\nor S3-compatible bucket\naudio · drums.wav · hits.json\nsheet_music.musicxml / .pdf"]
+    end
+
+    AB --> Sep --> DSP --> Inference --> Export
 
     WIO --> AB
     WHV --> Sep
     WHV --> Inference
     WDF --> Export
-    WHV <-->|"USE_MODAL=true"| GPU
+    WHV <-->|"prediction stage"| GPU
 
-    Export --> Persistence
-    Sep --> Persistence
-    Inference --> Persistence
+    Sep --> FS
+    Inference --> FS
+    Export --> FS
+    Export --> PG
 
     style AB fill:#1a1a2e,stroke:#e94560,color:#fff
     style STFT fill:#16213e,stroke:#0f3460,color:#fff
@@ -85,7 +95,7 @@ flowchart TB
     style WHV fill:#e94560,stroke:#fff,color:#fff
     style GPU fill:#7b2d8b,stroke:#fff,color:#fff
     style PG fill:#336791,stroke:#fff,color:#fff
-    style R2 fill:#f38020,stroke:#fff,color:#fff
+    style FS fill:#f38020,stroke:#fff,color:#fff
 ```
 
 ### Stage-by-Stage Pipeline Sequence
@@ -100,36 +110,36 @@ sequenceDiagram
     participant S3  as Storage
 
     API->>DB: INSERT job (status=queued)
-    API->>IO: dispatch Celery chain
+    API->>IO: dispatch Celery chain (or in-process in MVP mode)
 
     rect rgb(20, 40, 60)
-    Note over IO: Stage 1 — Signal Acquisition (5–15%)
-    IO->>S3: validate + store audio.mp3
+    Note over IO: Stage 1 — Ingestion (5–15%)
+    IO->>S3: download (YouTube) or locate upload, validate signal
     IO->>DB: progress=15
     end
 
     rect rgb(30, 20, 60)
-    Note over HV: Stage 2 — Source Separation (20–50%)
-    HV->>S3: load audio.mp3
-    HV->>HV: BS-Roformer transformer (SDR 12.96 dB)
-    HV->>S3: save drums.wav (mono, stereo-averaged)
+    Note over HV: Stage 2 — Separation (20–50%)
+    HV->>S3: load source audio
+    HV->>HV: BS-Roformer via audio-separator
+    HV->>S3: save drums.wav (mono, channel average)
     HV->>DB: progress=50
     end
 
     rect rgb(50, 20, 60)
-    Note over HV: Stage 3 — DSP + Inference (55–75%)
-    HV->>HV: STFT n_fft=2048 → spectral flux → peak pick
-    HV->>HV: AST batch=32 → sigmoid → 7-class labels
-    HV->>HV: Pydantic guardrails (BPM / polyphony / confidence)
+    Note over HV: Stage 3 — Onsets + Classification (55–75%)
+    HV->>HV: tempo estimate (librosa) → STFT spectral flux → peaks
+    HV->>HV: AST batch=32 → sigmoid → 7 drum classes
+    HV->>HV: guardrails + PredictionResult validation
     HV->>S3: save hits.json
     HV->>DB: progress=75
     end
 
     rect rgb(20, 40, 30)
-    Note over DF: Stage 4 — Structured Output (80–100%)
+    Note over DF: Stage 4 — Notation (80–100%)
     DF->>S3: load hits.json
-    DF->>DF: symusic C++ quantization → MusicXML
-    DF->>DF: LilyPond PDF render
+    DF->>DF: symusic Score, 16th-note quantization
+    DF->>DF: MusicXML export → LilyPond PDF
     DF->>S3: save sheet_music.musicxml + .pdf
     DF->>DB: progress=100, status=completed
     end
@@ -151,107 +161,108 @@ stateDiagram-v2
     separating_drums --> cancelling
     predicting --> cancelling
     transcribing --> cancelling
-    cancelling --> cancelled   : worker self-terminates (no SIGKILL)
+    cancelling --> cancelled   : next stage sees the status and stops
 
-    processing --> failed      : unhandled exception
+    processing --> failed      : exception in a stage
     separating_drums --> failed
     predicting --> failed
     transcribing --> failed
-    queued --> failed          : stale timeout 30 min
+    queued --> failed          : Celery Beat, active > 30 min
 ```
 
 ---
 
-## Architectural Choices
+## Design Choices
 
-### DSP Layer — Why STFT over Mel-Spectrograms
+### Onset Detection — Linear STFT and Spectral Flux
 
-The onset detector computes a raw **magnitude spectrogram** (not Mel-scaled) using `n_fft=2048` with `hop_length=512–1024` (adaptive: 512 at BPM > 110, 1024 otherwise). Mel-scaling is optimized for pitch perception; drum transients carry energy across the full spectral range. Spectral flux on a linear spectrogram captures the broadband energy burst of a drum hit without compressing the high-frequency transient content that distinguishes a snare from a hi-hat.
+`app/ml/onset_detection.py` computes a **linear magnitude spectrogram** (`torchaudio.transforms.Spectrogram`, `n_fft=2048`, `power=1.0`). The hop is 512 samples when the estimated tempo is above 110 BPM and 1024 otherwise. The onset envelope is the positive spectral flux summed over frequency bins and normalized to [0, 1]. Onsets are local maxima above a fixed threshold (`ONSET_SENSITIVITY`, default 0.05).
 
-The entire DSP chain stays in **torchaudio tensor space** (`torchaudio.transforms.Spectrogram`) — no intermediate NumPy conversion until the final peak extraction loop. This keeps the path GPU-compatible and minimizes memory allocation overhead.
+The reasoning: Mel scaling compresses the high-frequency range, and that is where much of the difference between hi-hats, cymbals and snares lives. A linear spectrogram keeps that range for the flux computation. The transform runs in torch tensors, and peak picking is a simple loop over the NumPy envelope.
 
-### Inference Engine — AST + ONNX
+### Classification — AST, Zero-Shot
 
-The Audio Spectrogram Transformer (`MIT/ast-finetuned-audioset-10-10-0.4593`) is a Vision Transformer adapted for audio. Each detected onset produces a fixed 8820-sample clip (resampled to 16kHz), batched at 32 clips per forward pass. The model outputs **multi-label sigmoid probabilities** across 527 AudioSet classes, which are post-processed through a deterministic `AUDIOSET_TO_DRUM_MAP` into 7 canonical drum classes.
+Each onset becomes a clip spanning about one 16th note at the estimated tempo. The clip is stretched or compressed to 8820 samples, resampled to 16 kHz and batched 32 at a time into `MIT/ast-finetuned-audioset-10-10-0.4593`. The model outputs sigmoid probabilities over the 527 AudioSet classes. Labels above 0.3 are mapped by name (`AUDIOSET_TO_DRUM_MAP`) to 7 drum classes: kick, snare, closed/open hi-hat, ride, crash, high tom. The model was trained on general AudioSet audio, not on isolated drum hits, so its per-class accuracy on this task is unmeasured (see Project Status).
 
-For production, the AST weights are compiled to **ONNX Runtime** via `scripts/export_ast_to_onnx.py` — 2.7x faster than eager PyTorch on CPU, eliminating the transformer overhead on non-GPU workers.
+### ONNX Export — Validated, Not Yet in the Serving Path
 
-### Symbolic Music — symusic C++ Backend
+`backend/scripts/export_ast_to_onnx.py` exports AST to ONNX (opset 14, dynamic batch and sequence axes). It checks that ONNX Runtime outputs match PyTorch within `1e-4`, then times both. Inference in `app/ml/engine.py` still uses PyTorch. Switching it to ONNX Runtime is planned.
 
-`symusic` replaces `music21` for the quantization and MusicXML serialization step. Its C++ core benchmarks **10–100x faster** than the Python equivalent, which matters at scale when the `worker-default` pool handles concurrent export jobs. 16th-note grid quantization is BPM-aligned: `grid_unit = 60 / bpm / 4` seconds.
+Measured on 2026-10-22 by running that script unchanged inside the MVP image (`onnxscript` added, since torch 2.14 needs it to export). Setup: AMD Ryzen 5 5500U under WSL2, CPU only, torch 2.14.1+cpu, onnxruntime 1.31 with default session options, one 10-second input (`1×1024×128` filterbank), 5 warm-up runs and 100 timed runs each. Outputs matched (max abs diff 1.2e-05). The **ONNX Runtime run was slower: 6.59 s vs 3.20 s per forward pass (0.49x)**. The speedup that older docs quote is not reproduced here. Graph optimization, thread settings and quantization have not been explored yet.
+
+### Notation — symusic
+
+`app/services/transcription.py` builds a `symusic.Score` at 480 ticks per quarter note. It maps each drum class to a General MIDI percussion note on a drum track and snaps note onsets to a 16th-note grid derived from the tempo. It also logs the average and maximum quantization drift in milliseconds. symusic is a C++-backed library. Its published benchmarks show MIDI parsing much faster than `mido`, `pretty_midi` and `miditoolkit` ([per symusic's benchmarks](https://github.com/Yikai-Liao/symusic#benchmark)). This project has not benchmarked its own quantization step.
 
 ---
 
-## Bottlenecks & Latency Optimizations
+## Reliability Measures
 
-| Bottleneck | Solution | Impact |
-|---|---|---|
-| Model cold-start (BS-Roformer ~700MB) | Singleton pattern + per-process lock | Load once, amortize across all jobs |
-| AST eager PyTorch on CPU | ONNX Runtime export | **2.7x** inference speedup |
-| Stereo→mono conversion | `tensor.mean(dim=0)` — stays in tensor space | Avoids NumPy round-trip per channel |
-| Duplicate audio uploads | SHA-256 `content_hash` in DB | Returns existing job in `0ms` vs full pipeline |
-| Retry after partial failure | `hits.json` existence + Pydantic validation check | `0.1s` vs `15s+` GPU inference re-run |
-| Clip resampling (per-onset) | `torchaudio.transforms.Resample` (GPU-compatible) | Replaces per-clip `librosa.resample` call |
-| Memory after inference | Explicit `del` + `gc.collect()` + `cuda.empty_cache()` | Keeps 4GB worker under peak RSS |
-| CPU Docker image size | `--index-url https://download.pytorch.org/whl/cpu` | Strips 2–4GB CUDA stack from non-GPU images |
+| Concern | What the code does |
+|---|---|
+| Model load cost | BS-Roformer and AST are loaded once per process (lock-guarded singletons). Celery `worker-heavy` preloads both at startup (`WORKER_MODE=true`). |
+| Duplicate uploads | Uploads are SHA-256 hashed. If the same client already has an in-flight job with the same hash, the API returns that job instead of creating a new one. |
+| Retries after partial failure | Stage 2 skips separation if `drums.wav` already exists. Stage 3 reuses `hits.json` if it passes `PredictionResult` validation. |
+| Memory | `worker-heavy` runs with `concurrency=1` and a 4 GB limit. Stages release large arrays and call `gc.collect()` / `torch.cuda.empty_cache()`. |
+| Image size | `torch`/`torchaudio` are installed from the PyTorch CPU wheel index to avoid pulling the CUDA stack. |
+| Stuck jobs | In Celery mode, Celery Beat marks jobs active for more than 30 minutes as `failed` and removes artifacts older than `ARTIFACT_TTL_HOURS` (24 h). |
 
-### Queue Design — Resource Isolation
+### Queue Design
 
-Three Celery queues prevent resource contention. The heavy-compute worker runs `concurrency=1` by design — BS-Roformer is a transformer that saturates available RAM at a single instance. Parallelism here causes OOM, not speedup.
+`docker-compose.yml` defines three queues, each consumed by its own worker service, so slow downloads and CPU-heavy model inference do not compete for the same worker slots:
 
 ```
 io              concurrency=8   512 MB   YouTube download, file validation
 heavy-compute   concurrency=1   4 GB     BS-Roformer separation + AST inference
-default         concurrency=4   1 GB     symusic quantization, LilyPond export
+default         concurrency=4   1 GB     symusic quantization, MusicXML/PDF export
 ```
 
-### Pydantic Data Contracts at the ML Boundary
+`worker-heavy` runs one task at a time because both models are held in memory in a 4 GB container.
+
+### Pydantic Contracts at the ML Boundary
 
 ```python
 class DrumHit(BaseModel):
     time:       float = Field(ge=0.0)
-    instrument: str   = Field(pattern="^(kick|snare|hihat_closed|...)$")
+    instrument: str   = Field(pattern="^(kick|snare|hihat_closed|hihat_open|ride|crash|tom_high|tom_mid|tom_low)$")
     velocity:   float = Field(ge=0.0, le=1.0)
     model_config = {"frozen": True}
 ```
 
-Three runtime guardrails at the inference boundary:
+`PredictionResult` also requires BPM in [40, 300], confidence in [0, 1], hits sorted by time, and a `hit_summary` that matches the hit list. `run_prediction()` validates its output with `model_validate()` before returning it. The worker then applies three heuristics (`app/ml/guardrails.py`) before writing `hits.json`:
 
-- **BPM sanity** — halves BPM > 200 (catches 16th-note double-counting)
-- **Polyphony cap** — max 4 simultaneous hits per 10ms window (physical constraint)
-- **Confidence filter** — drops hits with `velocity < 0.15` (eliminates ghost-note noise)
-
-The entire `PredictionResult` is validated via `model_validate()` before the result is written to storage — garbage-in/garbage-out is caught at the seam, not downstream.
+- **Tempo doubling:** BPM above 200 is halved and flagged `bpm_unreliable`.
+- **Polyphony cap:** at most 4 hits per 10 ms bucket, keeping the highest-confidence ones.
+- **Confidence floor:** hits with `velocity < 0.15` are dropped.
 
 ---
 
-## Built for Scale
+## Serverless GPU (Modal)
 
-The architecture is intentionally over-engineered for a one-user demo. That is the point.
+`backend/infrastructure/modal_app.py` defines a Modal app (`drumscribe-ml`) with one function, `process_audio_pipeline`. It runs on a T4 with 8 GB RAM and a 600 s timeout, and the model weights are baked into the image at build time. It runs separation, AST classification and the guardrails, then returns a Pydantic-validated result. With `USE_MODAL=true`, the `predict_hits` stage sends the audio to that function. If the Modal SDK or the deployed function is not available, it falls back to local inference. The author has deployed it and run jobs through it manually. Latency and cost have not been measured.
 
-Every design decision — queue isolation, Pydantic contracts at ML boundaries, ONNX compilation, scale-to-zero GPU, S3-compatible storage, OpenTelemetry tracing — reflects production constraints at 10,000 jobs/day, not 10. The serverless GPU tier costs **87–92% less** than always-on compute at 1,000 tracks/month ($35–55 vs $432 on AWS g4dn.xlarge). Cloudflare R2 reduces egress costs **92%** vs S3.
-
-The same `worker-heavy` service that runs BS-Roformer locally is a `modal.Function` on a T4 GPU when `USE_MODAL=true` is flipped — zero code change, sub-2s cold start, scale-to-zero billing. The infra was designed so that the bottleneck is never the architecture.
+Cost rationale (not measured): Modal bills per second of use and scales to zero, which suits sporadic, bursty jobs better than an always-on GPU instance.
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology | Decision Rationale |
+| Layer | Technology | Role |
 |---|---|---|
-| **Frontend** | Next.js 15, React 19, TypeScript | Server Actions + SSE for real-time progress |
-| **Sheet Music Render** | OpenSheetMusicDisplay | Interactive MusicXML in-browser, no PDF dependency |
-| **API** | FastAPI + SQLAlchemy async + Pydantic v2 | Async I/O for SSE streams; typed contracts throughout |
-| **Task Queue** | Celery + Redis | 3-tier queue isolation; Celery Beat for stale job GC |
-| **Drum Separation** | BS-Roformer via `audio-separator` | State-of-the-art SDR (12.96 dB), transformer architecture |
-| **Onset Detection** | torchaudio STFT + spectral flux | GPU-native, no librosa dependency in hot path |
-| **Hit Classification** | AST → ONNX Runtime | 527-class AudioSet → 7 drum classes; 2.7x CPU speedup |
-| **Symbolic Music** | symusic (C++ backend) | 10–100x over music21; 16th-note BPM-aligned quantization |
-| **PDF Export** | LilyPond | Professional music engraving, server-side |
-| **Storage** | Cloudflare R2 / Local FS | S3-compatible; $0 egress |
-| **Database** | PostgreSQL 16 | Job state machine; SHA-256 content dedup |
-| **Observability** | Prometheus + OpenTelemetry + Jaeger | `INFERENCE_LATENCY`, `JOBS_TOTAL`, Celery auto-instrumentation |
-| **Serverless GPU** | Modal (NVIDIA T4) | Scale-to-zero; `USE_MODAL=true` flag, no code change |
+| **Frontend** | Next.js 16, React 19, TypeScript | Upload UI, Server Actions, SSE progress (`EventSource`) |
+| **Sheet music render** | OpenSheetMusicDisplay | In-browser MusicXML rendering |
+| **API** | FastAPI, SQLAlchemy (async), Pydantic v2 | Job API, SSE stream, typed schemas |
+| **Task queue** | Celery + Redis | Three queues; Celery Beat for cleanup and stale-job expiry |
+| **Separation** | BS-Roformer via `audio-separator` | Source separation stage |
+| **Onset detection** | torchaudio STFT + spectral flux | Onset times |
+| **Tempo** | librosa (madmom when installed) | BPM estimate for windowing and quantization |
+| **Hit classification** | AST (AudioSet), PyTorch | Onset clip → drum class; ONNX export script available |
+| **Symbolic music** | symusic | Score building and 16th-note quantization |
+| **PDF export** | LilyPond (`musicxml2ly`) | Server-side engraving |
+| **Storage** | Local volume, or any S3-compatible bucket via boto3 | `S3_ENDPOINT_URL` targets Cloudflare R2 or MinIO |
+| **Database** | PostgreSQL 16 | Job state, content hash |
+| **Observability** | structlog, Prometheus client, OpenTelemetry SDK | JSON logs, `/metrics`, tracer provider (see below) |
+| **Serverless GPU** | Modal (NVIDIA T4) | Optional remote inference, `USE_MODAL=true` |
 
 ---
 
@@ -260,28 +271,32 @@ The same `worker-heavy` service that runs BS-Roformer locally is a `modal.Functi
 ### MVP Mode (no queue, no Redis)
 
 ```bash
-git clone https://github.com/your-org/cdrumscribe.git && cd cdrumscribe
+git clone https://github.com/MatPizzolo/Automatic-Drum-Transcription.git
+cd Automatic-Drum-Transcription
 cp .env.example .env
 docker compose -f docker-compose.mvp.yml up -d
-# → http://localhost:3000  (frontend)
-# → http://localhost:8000/docs  (API)
+# → http://localhost:3000       (frontend)
+# → http://localhost:8000/docs  (API docs)
 ```
 
-> First run downloads ML models (~700 MB). Health check has a 120s grace period.
+> The first build installs PyTorch, `audio-separator` and LilyPond, so it takes a while (about 30 minutes on a laptop with a home connection). Models are downloaded on the first job, not at startup: the BS-Roformer checkpoint is about 640 MB, and the AST weights are fetched from Hugging Face. See Project Status for the issues that currently stop jobs from completing.
 
-### Full Production Stack
+### Celery Mode
 
 ```bash
-docker compose up -d                                  # all workers + Redis + Beat
-docker compose --profile observability up -d          # + Jaeger tracing UI
-docker compose up -d --scale worker-heavy=2           # horizontal GPU scale
+docker compose -f docker-compose.yml up -d                          # API, 3 workers, Beat, Redis, Postgres
+docker compose -f docker-compose.yml --profile observability up -d  # + Jaeger
+docker compose -f docker-compose.yml up -d --scale worker-heavy=2   # more heavy-compute workers
 ```
+
+Running plain `docker compose up -d` also applies `docker-compose.override.yml`, which switches to dev settings (hot reload, `npm run dev`, mounted source).
 
 | Service | URL |
 |---|---|
 | Frontend | http://localhost:3000 |
 | API | http://localhost:8000 |
 | API Docs | http://localhost:8000/docs |
+| Prometheus metrics | http://localhost:8000/metrics |
 | Jaeger UI | http://localhost:16686 |
 
 ---
@@ -290,34 +305,39 @@ docker compose up -d --scale worker-heavy=2           # horizontal GPU scale
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/api/jobs` | Create job — multipart file **or** `youtube_url` |
-| `GET` | `/api/jobs/{id}` | Poll: status, progress (0–100%), warnings |
+| `POST` | `/api/jobs` | Create a job: multipart `file` **or** `youtube_url`, plus optional `title`, `bpm`, `webhook_url` |
+| `GET` | `/api/jobs/{id}` | Status, progress (0–100), warnings |
 | `GET` | `/api/jobs/{id}/result` | Hits, BPM, confidence, download URLs |
-| `GET` | `/api/jobs/{id}/download/musicxml` | Stream MusicXML |
-| `GET` | `/api/jobs/{id}/download/pdf` | Stream PDF |
-| `DELETE` | `/api/jobs/{id}` | Graceful cancel (worker self-terminates) |
-| `GET` | `/api/events/{id}` | SSE stream — real-time status events |
-| `GET` | `/api/health` | DB + storage + model registry health |
+| `GET` | `/api/jobs/{id}/download/musicxml` | Download MusicXML |
+| `GET` | `/api/jobs/{id}/download/pdf` | Download PDF |
+| `DELETE` | `/api/jobs/{id}` | Cancel an active job (marks it `cancelling`, revokes the Celery chain without killing the running task) and delete its artifacts |
+| `GET` | `/api/jobs/{id}/events` | Server-Sent Events stream of status updates |
+| `GET` | `/api/health` | Database, Redis (Celery mode) and model cache directory checks |
 
 ---
 
 ## Observability
 
-- **Structured logs** — JSON via `structlog`; every task emits `job_id` + elapsed ms
-- **Prometheus metrics** — `INFERENCE_LATENCY`, `JOBS_TOTAL`, `ACTIVE_JOBS_GAUGE`, `AUDIO_DURATION_PROCESSED`
-- **OpenTelemetry tracing** — Celery tasks auto-instrumented; Jaeger export via `--profile observability`
-- **Health endpoint** — `GET /api/health` checks DB, storage, and model registry
-- **Stale job expiry** — Celery Beat marks jobs stuck > 30 min as `failed`
+- **Structured logs:** JSON via `structlog`. Each HTTP request gets a correlation ID (`X-Request-ID`), and each task logs `job_id` and elapsed milliseconds.
+- **Prometheus metrics:** `inference_latency_seconds` (per stage), `jobs_total`, `jobs_failed_total`, `active_jobs_gauge` and `audio_duration_seconds_processed`, exposed by the API at `/metrics`. Celery workers record the same metrics in their own processes but do not expose an endpoint yet.
+- **Tracing:** the API configures an OpenTelemetry tracer provider with an OTLP/HTTP exporter, and the instrumentation packages for FastAPI and Celery are installed. No instrumentor is enabled yet, and `OTLP_ENDPOINT` is not wired to the Jaeger service in Compose. End-to-end tracing is planned.
+- **Health endpoint:** `GET /api/health` checks the database, Redis (Celery mode only) and whether the model cache directory exists.
+- **Stale jobs:** in Celery mode, Celery Beat marks jobs active for more than 30 minutes as `failed`.
 
 ---
 
 ## Testing
 
 ```bash
-cd backend && pytest tests/unit/        # guardrails, contracts, onset detection
-pytest tests/integration/               # API endpoints + DB
-pytest tests/regression/                # golden file comparison
+cd backend
+pip install -r requirements-worker.txt -r requirements-test.txt
+pytest tests/unit/ tests/regression/       # guardrails, contracts, onset detection, golden files
+pytest tests/integration/ -m integration   # API + DB; needs PostgreSQL and Redis running
 ```
+
+`pyproject.toml` deselects `integration` and `slow` tests by default, so integration tests only run with `-m integration`.
+
+Current state (2026-10-22, run inside the MVP image): **103 passed, 26 failed**. The failures are in `test_transcription.py` and in the transcription/export cases of `test_golden.py`, all of which exercise symusic. The GitHub Actions workflow is failing on `main` too: `requirements-test.txt` does not pull NumPy, and `compose-validate` expects a `.env` file.
 
 ---
 
@@ -325,11 +345,14 @@ pytest tests/regression/                # golden file comparison
 
 | Guide | Contents |
 |---|---|
-| [System Architecture](docs/ARCHITECTURE.md) | Data flow, security, decoupled serverless design |
-| [ML Pipeline](docs/ML_PIPELINE.md) | torchaudio → BS-Roformer → ONNX → symusic deep-dive |
-| [Modal Deployment](docs/MODAL_DEPLOYMENT.md) | Serverless GPU config, cold-start optimization |
-| [Production Deployment](docs/DEPLOYMENT.md) | Vercel + Fly.io + Modal + R2 step-by-step |
-| [API Reference](docs/API_REFERENCE.md) | Complete REST API documentation |
+| [System Architecture](docs/ARCHITECTURE.md) | Data flow, security, serverless design |
+| [ML Pipeline](docs/ML_PIPELINE.md) | Separation, onsets, AST, symusic |
+| [Modal Deployment](docs/MODAL_DEPLOYMENT.md) | Serverless GPU setup |
+| [Production Deployment](docs/DEPLOYMENT.md) | Vercel + Fly.io + Modal + R2 walkthrough |
+| [API Reference](docs/API_REFERENCE.md) | REST API details |
+| [Testing](docs/TESTING.md) | Test layout and how to run it |
+
+> The guides in `docs/` predate this README revision and still contain unmeasured figures (cost estimates, speedups). Where they disagree, this README reflects the current code.
 
 ---
 
