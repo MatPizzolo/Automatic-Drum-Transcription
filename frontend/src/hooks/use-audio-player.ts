@@ -25,7 +25,10 @@ export function useAudioPlayer(src?: string) {
 
     const audio = new Audio(src);
     audioRef.current = audio;
-    setState((prev) => ({ ...prev, isLoading: true, error: null }));
+
+    const onLoadStart = () => {
+      setState((prev) => ({ ...prev, isLoading: true, error: null }));
+    };
 
     const onLoadedMetadata = () => {
       setState((prev) => ({
@@ -51,6 +54,7 @@ export function useAudioPlayer(src?: string) {
       }));
     };
 
+    audio.addEventListener("loadstart", onLoadStart);
     audio.addEventListener("loadedmetadata", onLoadedMetadata);
     audio.addEventListener("timeupdate", onTimeUpdate);
     audio.addEventListener("ended", onEnded);
@@ -58,6 +62,7 @@ export function useAudioPlayer(src?: string) {
 
     return () => {
       audio.pause();
+      audio.removeEventListener("loadstart", onLoadStart);
       audio.removeEventListener("loadedmetadata", onLoadedMetadata);
       audio.removeEventListener("timeupdate", onTimeUpdate);
       audio.removeEventListener("ended", onEnded);

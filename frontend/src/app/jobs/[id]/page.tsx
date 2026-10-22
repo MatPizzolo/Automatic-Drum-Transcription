@@ -35,9 +35,8 @@ export default function ProcessingPage() {
   useEffect(() => {
     if (job && job.status !== "completed" && job.status !== "failed") {
       staleTimerRef.current = setTimeout(() => setIsStale(true), STALE_JOB_TIMEOUT_MS);
-    } else {
-      setIsStale(false);
     }
+    // No reset needed: the banner below only renders for non-terminal statuses
     return () => {
       if (staleTimerRef.current) clearTimeout(staleTimerRef.current);
     };
