@@ -11,7 +11,7 @@ Architecture:
 - Strict typing: Pydantic contracts enforced end-to-end
 
 Cost Optimization:
-- Model weights cached during image build (AST + BS-Roformer)
+- Model weights cached during image build (AST + Demucs htdemucs)
 - Cold starts: <2 seconds (vs. 30-60s without caching)
 - Saves ~$0.50-$2.00 per cold start on wasted GPU time
 
@@ -31,6 +31,9 @@ import modal
 
 app = modal.App("drumscribe-ml")
 
+# audio-separator model for drum-stem separation (mirrors settings.SEPARATION_MODEL)
+SEPARATION_MODEL = "htdemucs.yaml"
+
 # ---------------------------------------------------------------------------
 # Docker Image with Aggressive Weight Caching
 # ---------------------------------------------------------------------------
@@ -46,7 +49,7 @@ def download_model_weights():
     
     Models cached:
     1. HuggingFace AST model (MIT/ast-finetuned-audioset-10-10-0.4593)
-    2. BS-Roformer checkpoint (model_bs_roformer_ep_368_sdr_12.9628.ckpt)
+    2. Demucs v4 htdemucs checkpoint (4-stem: drums/bass/other/vocals)
     
     Cost savings: ~$0.50-$2.00 per cold start (GPU idle time eliminated)
     """
@@ -62,7 +65,7 @@ def download_model_weights():
     _ = ASTFeatureExtractor.from_pretrained(model_name)
     print(f"✅ AST model cached: {model_name}")
     
-    print("🔥 Downloading BS-Roformer checkpoint...")
+    print("🔥 Downloading Demucs htdemucs checkpoint...")
     # Create cache directory
     cache_dir = "/root/model_cache"
     os.makedirs(cache_dir, exist_ok=True)
@@ -74,8 +77,8 @@ def download_model_weights():
     )
     
     # Load model - this downloads the .ckpt file if not present
-    separator.load_model(model_filename="model_bs_roformer_ep_368_sdr_12.9628.ckpt")
-    print(f"✅ BS-Roformer cached: {cache_dir}")
+    separator.load_model(model_filename=SEPARATION_MODEL)
+    print(f"✅ Separation model cached: {cache_dir}")
     
     print("🎉 All model weights cached successfully!")
 
@@ -90,9 +93,11 @@ image = (
     )
     .pip_install(
         # Core ML dependencies
-        "torch>=2.0.0,<3.0.0",
-        "torchaudio>=2.0.0",
-        "transformers>=4.35.0",
+        # Pinned to match backend/requirements-worker.txt
+        "torch==2.5.1",
+        "torchaudio==2.5.1",
+        "torchvision==0.20.1",
+        "transformers>=4.35.0,<5",
         
         # Audio processing
         "audio-separator[gpu]==0.22.2",
@@ -100,7 +105,7 @@ image = (
         "numpy==1.26.4",
         
         # Symbolic music
-        "symusic>=0.4.0",
+        "symusic==0.6.0",
         
         # Data validation
         "pydantic>=2.0.0",
@@ -180,7 +185,7 @@ def process_audio_pipeline(
     
     This function runs the entire ML pipeline on Modal's serverless infrastructure:
     1. Download audio (if URL provided) or use provided bytes
-    2. Separate drums using BS-Roformer
+    2. Separate the drum stem (Demucs htdemucs via audio-separator)
     3. Detect hits using AST transformer
     4. Apply ML guardrails (BPM sanity, polyphony, confidence filtering)
     5. Return Pydantic-validated results
@@ -240,25 +245,26 @@ def process_audio_pipeline(
         print(f"✅ Audio loaded: {len(audio_bytes)} bytes")
         
         # -------------------------------------------------------------------------
-        # Step 2: Drum Separation (BS-Roformer)
+        # Step 2: Drum Separation (Demucs htdemucs)
         # -------------------------------------------------------------------------
         
-        print("🥁 Separating drums with BS-Roformer...")
+        print("🥁 Separating drums...")
         drums_path = tmpdir_path / "drums.wav"
         
         separator = Separator(
             output_dir=str(tmpdir_path),
             model_file_dir="/root/model_cache",  # Use cached weights
         )
-        separator.load_model(model_filename="model_bs_roformer_ep_368_sdr_12.9628.ckpt")
+        separator.load_model(model_filename=SEPARATION_MODEL)
         
         output_files = separator.separate(str(input_path))
         
-        # Find drums output (BS-Roformer outputs: drums, bass, other, vocals)
+        # Find drums output (htdemucs outputs: drums, bass, other, vocals).
+        # audio-separator returns bare filenames inside output_dir.
         drums_output = None
         for file in output_files:
             if "drums" in Path(file).stem.lower():
-                drums_output = file
+                drums_output = str(tmpdir_path / Path(file).name)
                 break
         
         if not drums_output:

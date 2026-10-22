@@ -61,7 +61,7 @@ def build_sheet_music(
     )
 
     # Create symusic Score with standard MIDI resolution
-    score = symusic.Score(ticks_per_quarter=480)
+    score = symusic.Score(480)  # ticks per quarter note
     
     # Add tempo (quarter notes per minute)
     score.tempos.append(symusic.Tempo(time=0, qpm=bpm))
@@ -91,6 +91,9 @@ def build_sheet_music(
 
     # Track quantization drift for each note
     quantization_drifts = []  # Store drift in milliseconds for each note
+    # Unquantized onset times, parallel to drum_track.notes
+    # (symusic Notes are C++ objects and do not accept extra attributes)
+    original_times_ticks = []
 
     # Convert hits to symusic Notes
     for hit in hits_sorted:
@@ -126,14 +129,13 @@ def build_sheet_music(
         drum_track.notes.append(note)
         
         # Store original unquantized time for drift calculation
-        note._original_time_ticks = time_ticks_original
+        original_times_ticks.append(time_ticks_original)
 
     # Apply symusic's native quantization to 16th note grid
     quantize_unit = score.ticks_per_quarter // 4  # 16th note
     
     # Calculate quantization drift for each note
-    for note in drum_track.notes:
-        original_time = getattr(note, '_original_time_ticks', note.time)
+    for note, original_time in zip(drum_track.notes, original_times_ticks):
         quantized_time = round(note.time / quantize_unit) * quantize_unit
         
         # Calculate drift in ticks

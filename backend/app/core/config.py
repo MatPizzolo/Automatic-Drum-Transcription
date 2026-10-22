@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     MODEL_VERSION: str = "ast-audioset-10-10-0.4593"
     MODEL_URI: str = ""      # Unused — models are fetched from HuggingFace / audio-separator
     MODEL_SHA256: str = ""   # Unused — no checksum required for HuggingFace downloads
+    # audio-separator model used for drum-stem separation (must output a "Drums" stem)
+    SEPARATION_MODEL: str = "htdemucs.yaml"
 
     # S3 Storage (only used when STORAGE_BACKEND=s3)
     S3_BUCKET: str = ""

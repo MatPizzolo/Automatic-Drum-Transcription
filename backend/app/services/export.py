@@ -21,8 +21,8 @@ def export_musicxml(score: Any, output_path: str) -> str:
     """
     Export a symusic Score to MusicXML format.
     
-    symusic natively supports MusicXML export via dump_musicxml() method.
-    Falls back to MIDI export if MusicXML is not supported.
+    Uses symusic's dump_musicxml() when available. symusic (up to at least
+    0.6) only writes MIDI/ABC, so the usual path is MIDI -> music21 -> MusicXML.
     """
     logger.info("export_musicxml_start", output=output_path)
     
@@ -35,7 +35,7 @@ def export_musicxml(score: Any, output_path: str) -> str:
             return output_path
         elif hasattr(score, 'dump_midi'):
             # Fallback: export as MIDI, then convert to MusicXML
-            logger.warning("musicxml_not_supported_using_midi_fallback")
+            logger.info("musicxml_via_midi_and_music21")
             midi_path = str(Path(output_path).with_suffix('.mid'))
             score.dump_midi(midi_path)
             

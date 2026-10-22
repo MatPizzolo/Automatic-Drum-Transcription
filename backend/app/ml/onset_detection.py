@@ -41,6 +41,12 @@ def _detect_onsets_pytorch(
     # Ensure waveform is on CPU for torchaudio transforms (compatibility)
     device = waveform.device
     waveform = waveform.cpu()
+
+    # The onset envelope is normalized to its own maximum below, so without an
+    # absolute floor, background noise in near-silent audio would produce peaks.
+    MIN_PEAK_AMPLITUDE = 1e-4  # ~ -80 dBFS
+    if waveform.numel() == 0 or waveform.abs().max() < MIN_PEAK_AMPLITUDE:
+        return []
     
     # --- Step 1: Compute STFT Spectrogram ---
     n_fft = 2048

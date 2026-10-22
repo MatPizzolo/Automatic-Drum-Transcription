@@ -24,7 +24,7 @@ COPY requirements-api.txt requirements-worker.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel && \
     pip install --index-url https://download.pytorch.org/whl/cpu \
-        "torch>=2.0.0,<3.0.0" "torchaudio>=2.0.0" && \
+        torch==2.5.1 torchaudio==2.5.1 torchvision==0.20.1 && \
     pip install -r requirements-worker.txt
 
 # ---- runtime stage ----
