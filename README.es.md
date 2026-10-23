@@ -10,7 +10,7 @@ CDrumscribe recibe una canción (un archivo de audio o una URL de YouTube). Sepa
 
 | Ingesta | Separación | Onsets + clasificación | Salida |
 |---|---|---|---|
-| Archivo / YouTube (yt-dlp) | BS-Roformer vía `audio-separator` | Flujo espectral STFT → AST (AudioSet) | Partitura symusic → MusicXML / PDF |
+| Archivo / YouTube (yt-dlp) | Demucs v4 (`htdemucs`) vía `audio-separator` | Flujo espectral STFT → AST (AudioSet) | Partitura symusic → MusicXML / PDF |
 
 </div>
 
@@ -18,13 +18,10 @@ CDrumscribe recibe una canción (un archivo de audio o una URL de YouTube). Sepa
 
 ## Estado del Proyecto
 
-Es un proyecto personal. Este es su estado, verificado contra el código el 2026-10-22:
+Es un proyecto personal. Este es su estado, verificado contra el código el 2026-10-23 (después de las correcciones del pipeline en #2):
 
-- **Funciona:** el stack MVP (`docker-compose.mvp.yml`) se construye desde un clon limpio y queda saludable. La API (`/docs`, `/api/health`) y el frontend responden.
-- **Problemas conocidos en las imágenes actuales** (los detalles y las correcciones se siguen aparte de este README):
-  - `torchvision` se instala desde PyPI junto al `torch` solo-CPU, así que `transformers` no puede importar el modelo AST y los jobs fallan en la etapa de separación. Instalar `torchvision` desde el índice CPU de PyTorch supera este error (probado localmente).
-  - El checkpoint de separación `model_bs_roformer_ep_368_sdr_12.9628.ckpt` es un modelo de **voces/instrumental** (según su configuración en `audio-separator`). Su SDR de 12.96 dB corresponde a voces, no a batería. El código pide un stem `Drums`, así que la etapa termina con `Separator did not produce drums output`. Hace falta un modelo de separación que produzca batería.
-  - `symusic` 0.6 no tiene escritor de MusicXML. El código recurre a MIDI → `music21`, y `music21` no está instalado en las imágenes.
+- **Funciona de punta a punta:** desde un clon limpio, el stack MVP se construye y procesa un job por las cuatro etapas. Con un loop de prueba de 10 segundos (laptop, solo CPU), termina en unos 5 minutos y devuelve un MusicXML descargable. La etapa de PDF genera el archivo cuando la partitura tiene notas (verificado con una partitura de ejemplo).
+- **La calidad de detección es el problema abierto:** en ese loop sintético, AST **no etiquetó ningún golpe**, así que la partitura salió vacía, aunque el tempo estimado fue correcto (99 contra 100 BPM). La causa es estructural: AST espera entradas de ~10 s, así que cada clip de ~150 ms se rellena hasta 1024 frames. Eso deja las probabilidades de batería en ~0.1, debajo del umbral de 0.3, y hace que cada clip cueste una pasada completa de 10 s. El próximo paso es un clasificador entrenado con golpes cortos de batería.
 - **Sin evaluar todavía:** no hay un benchmark de precisión de transcripción (por ejemplo, F-measure en ENST-Drums o MDB Drums). Es el principal próximo paso.
 - **Clasificador:** el modelo AST es el checkpoint estándar de AudioSet, usado sin entrenamiento adicional (*zero-shot*). Sus 527 etiquetas de AudioSet se mapean por nombre a clases de batería. No se ajustó con datos de batería.
 
@@ -41,7 +38,7 @@ flowchart TB
     end
 
     subgraph Sep["Separación de fuentes"]
-        BSR["BS-Roformer (audio-separator)\n──────────────\nmodel_bs_roformer_ep_368\nestéreo → stem mono"]
+        BSR["Demucs v4 htdemucs (audio-separator)\n──────────────\ndrums / bass / other / vocals\nstem Drums → mono"]
     end
 
     subgraph DSP["Onsets + Tempo"]
@@ -121,7 +118,7 @@ sequenceDiagram
     rect rgb(30, 20, 60)
     Note over HV: Etapa 2 — Separación (20–50%)
     HV->>S3: carga el audio fuente
-    HV->>HV: BS-Roformer vía audio-separator
+    HV->>HV: Demucs htdemucs vía audio-separator
     HV->>S3: guarda drums.wav (mono, promedio de canales)
     HV->>DB: progress=50
     end
@@ -200,7 +197,7 @@ Medido el 2026-10-22 corriendo ese script sin cambios dentro de la imagen MVP (c
 
 | Tema | Qué hace el código |
 |---|---|
-| Costo de carga de modelos | BS-Roformer y AST se cargan una vez por proceso (singletons protegidos con un lock). El `worker-heavy` de Celery precarga ambos al arrancar (`WORKER_MODE=true`). |
+| Costo de carga de modelos | El modelo de separación y AST se cargan una vez por proceso (singletons protegidos con un lock). El `worker-heavy` de Celery precarga ambos al arrancar (`WORKER_MODE=true`). |
 | Archivos duplicados | Los archivos se hashean con SHA-256. Si el mismo cliente ya tiene un job en curso con el mismo hash, la API devuelve ese job en lugar de crear uno nuevo. |
 | Reintentos tras una falla parcial | La etapa 2 omite la separación si `drums.wav` ya existe. La etapa 3 reutiliza `hits.json` si pasa la validación de `PredictionResult`. |
 | Memoria | `worker-heavy` corre con `concurrency=1` y un límite de 4 GB. Las etapas liberan los arreglos grandes y llaman a `gc.collect()` / `torch.cuda.empty_cache()`. |
@@ -213,7 +210,7 @@ Medido el 2026-10-22 corriendo ese script sin cambios dentro de la imagen MVP (c
 
 ```
 io              concurrency=8   512 MB   descarga de YouTube, validación de archivos
-heavy-compute   concurrency=1   4 GB     separación BS-Roformer + inferencia AST
+heavy-compute   concurrency=1   4 GB     separación Demucs + inferencia AST
 default         concurrency=4   1 GB     cuantización symusic, exportación MusicXML/PDF
 ```
 
@@ -253,7 +250,7 @@ Criterio de costo (sin medir): Modal cobra por segundo de uso y escala a cero, l
 | **Render de partitura** | OpenSheetMusicDisplay | Render de MusicXML en el navegador |
 | **API** | FastAPI, SQLAlchemy (async), Pydantic v2 | API de jobs, stream SSE, esquemas tipados |
 | **Cola de tareas** | Celery + Redis | Tres colas; Celery Beat para limpieza y vencimiento de jobs |
-| **Separación** | BS-Roformer vía `audio-separator` | Etapa de separación de fuentes |
+| **Separación** | Demucs v4 `htdemucs` vía `audio-separator` | Separación del stem de batería; modelo configurable con `SEPARATION_MODEL` |
 | **Detección de onsets** | STFT de torchaudio + flujo espectral | Tiempos de ataque |
 | **Tempo** | librosa (madmom si está instalado) | Estimación de BPM para ventanas y cuantización |
 | **Clasificación de golpes** | AST (AudioSet), PyTorch | Clip del onset → clase de batería; hay un script de exportación a ONNX |
@@ -279,7 +276,7 @@ docker compose -f docker-compose.mvp.yml up -d
 # → http://localhost:8000/docs  (documentación de la API)
 ```
 
-> El primer build instala PyTorch, `audio-separator` y LilyPond, así que tarda (unos 30 minutos en una laptop con conexión hogareña). Los modelos se descargan con el primer job, no al arrancar: el checkpoint de BS-Roformer pesa unos 640 MB y los pesos de AST se bajan de Hugging Face. Ver Estado del Proyecto para los problemas que hoy impiden que los jobs terminen.
+> El primer build instala PyTorch, `audio-separator` y LilyPond, así que tarda (unos 30 minutos en una laptop con conexión hogareña). Los modelos se descargan con el primer job, no al arrancar: el checkpoint de Demucs `htdemucs` (~80 MB) y los pesos de AST desde Hugging Face. En CPU, un job sobre un clip de 10 segundos tarda unos 5 minutos.
 
 ### Modo Celery
 
@@ -337,7 +334,7 @@ pytest tests/integration/ -m integration   # API + DB; requiere PostgreSQL y Red
 
 `pyproject.toml` excluye por defecto los tests `integration` y `slow`, así que los de integración solo corren con `-m integration`.
 
-Estado actual (2026-10-22, corrido dentro de la imagen MVP): **103 pasan, 26 fallan**. Las fallas están en `test_transcription.py` y en los casos de transcripción/exportación de `test_golden.py`, todos ellos ejercitan symusic. El workflow de GitHub Actions también falla en `main`: `requirements-test.txt` no instala NumPy, y `compose-validate` espera un archivo `.env`.
+Estado actual (2026-10-23): **128 pasan** en la selección por defecto; el test `slow` de AST también pasa cuando se corre con `-m slow`. El CI hace la misma instalación (primero torch CPU, después los requirements del worker y de tests).
 
 ---
 
