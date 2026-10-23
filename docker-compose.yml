@@ -8,6 +8,9 @@ x-storage-env: &storage-env
   ARTIFACTS_DIR: /data/artifacts
   MODEL_CACHE_DIR: /data/models
   TORCH_HOME: /data/models
+  # huggingface_hub writes locks/logs under HF_HOME even with cache_dir set;
+  # the default (~/.cache) is not writable on the read-only root filesystem
+  HF_HOME: /data/models/huggingface
   STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
   S3_BUCKET: ${S3_BUCKET:-}
   S3_PREFIX: ${S3_PREFIX:-artifacts}

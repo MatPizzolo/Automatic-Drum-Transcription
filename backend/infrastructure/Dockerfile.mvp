@@ -58,6 +58,7 @@ USER appuser
 
 ENV USE_CELERY=false \
     MPLCONFIGDIR=/tmp/matplotlib \
+    HF_HOME=/data/models/huggingface \
     NUMBA_CACHE_DIR=/tmp/numba_cache
 
 EXPOSE 8000

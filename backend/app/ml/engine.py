@@ -293,25 +293,17 @@ def run_prediction(
         if len(clip) == 0:
             continue
 
-        # Resample to target length using tensor operations (avoid librosa)
+        # Stretch/compress the clip to a fixed length. Linear interpolation is
+        # O(n); a per-clip torchaudio Resample to an arbitrary rate builds a
+        # sinc kernel sized by gcd(sr, new_sr) and dominated pipeline runtime.
         if len(clip) != TARGET_LENGTH:
-            # Convert clip to tensor for resampling
-            clip_tensor = torch.from_numpy(clip).unsqueeze(0)  # Add channel dim
-            
-            # Use torchaudio's Resample transform
-            ratio = TARGET_LENGTH / len(clip)
-            target_sr_temp = int(sr * ratio)
-            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr_temp)
-            clip_resampled = resampler(clip_tensor).squeeze(0)
-            
-            # Ensure exact target length via padding/truncation
-            if clip_resampled.shape[0] > TARGET_LENGTH:
-                clip = clip_resampled[:TARGET_LENGTH].numpy()
-            elif clip_resampled.shape[0] < TARGET_LENGTH:
-                zero_pad_length = TARGET_LENGTH - clip_resampled.shape[0]
-                clip = torch.nn.functional.pad(clip_resampled, (0, zero_pad_length)).numpy()
-            else:
-                clip = clip_resampled.numpy()
+            clip_tensor = torch.from_numpy(np.ascontiguousarray(clip, dtype=np.float32))
+            clip = torch.nn.functional.interpolate(
+                clip_tensor.view(1, 1, -1),
+                size=TARGET_LENGTH,
+                mode="linear",
+                align_corners=False,
+            ).view(-1).numpy()
 
         clips.append(clip)
         valid_onset_times.append(onset / sr)  # Convert samples to seconds

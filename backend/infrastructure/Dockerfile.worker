@@ -57,6 +57,7 @@ RUN mkdir -p /data/artifacts /data/models /tmp/celery \
 USER appuser
 
 ENV MPLCONFIGDIR=/tmp/matplotlib \
+    HF_HOME=/data/models/huggingface \
     NUMBA_CACHE_DIR=/tmp/numba_cache
 
 # Allow Celery to shut down gracefully before Docker kills the container.
