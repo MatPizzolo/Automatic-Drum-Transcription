@@ -35,6 +35,7 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
 @requires_soundfile
+@pytest.mark.slow  # downloads the AST weights from Hugging Face
 class TestPredictionPipeline:
     """Test the prediction pipeline with AST model."""
 

@@ -1,8 +1,8 @@
 """
-ML Engine — orchestrates BS-Roformer drum separation and AST prediction.
+ML Engine — orchestrates drum-stem separation and AST prediction.
 
 Responsibilities:
-- Singleton model loading for BS-Roformer and AST
+- Singleton model loading for the separation model and AST
 - Strict Pydantic validation (PredictionResult)
 - High-performance torchaudio tensor pipeline
 - Minimal CPU/GPU memory transfers
@@ -70,9 +70,10 @@ _ast_device = None
 
 def run_drum_separation(input_path: str, output_path: str) -> None:
     """
-    Isolate drums from a full mix using BS-Roformer via audio-separator.
+    Isolate the drum stem from a full mix via audio-separator.
 
-    Isolate drums from a full mix using BS-Roformer via audio-separator.
+    The model is configured by settings.SEPARATION_MODEL (default: Demucs v4
+    htdemucs, a 4-stem drums/bass/other/vocals model).
     """
     from audio_separator.separator import Separator
     import torch
@@ -89,13 +90,12 @@ def run_drum_separation(input_path: str, output_path: str) -> None:
             _separator_instance = Separator(
                 output_dir=output_dir,
                 output_format="wav",
-                output_single_stem="Drums",  # BS-Roformer uses "Drums" (capital D)
+                output_single_stem="Drums",  # audio-separator stem name (capital D)
                 model_file_dir=settings.MODEL_CACHE_DIR,  # Use existing cache dir
             )
             
-            # Load BS-Roformer model
-            _separator_instance.load_model(model_filename="model_bs_roformer_ep_368_sdr_12.9628.ckpt")
-            logger.info("separator_model_loaded")
+            _separator_instance.load_model(model_filename=settings.SEPARATION_MODEL)
+            logger.info("separator_model_loaded", model=settings.SEPARATION_MODEL)
         else:
             logger.info("separator_using_cached_instance")
 
@@ -104,11 +104,15 @@ def run_drum_separation(input_path: str, output_path: str) -> None:
     # audio-separator returns list of output file paths
     output_files = _separator_instance.separate(input_path)
 
-    # Find the drums output file
+    # Find the drums output file. audio-separator returns bare filenames,
+    # written to the output_dir the singleton was created with.
     drums_output = None
     for f in output_files:
         if "Drums" in f or "drums" in f:
-            drums_output = f
+            candidate = Path(f)
+            if not candidate.is_absolute():
+                candidate = Path(_separator_instance.output_dir) / candidate
+            drums_output = str(candidate)
             break
 
     if drums_output is None or not Path(drums_output).exists():
@@ -289,25 +293,17 @@ def run_prediction(
         if len(clip) == 0:
             continue
 
-        # Resample to target length using tensor operations (avoid librosa)
+        # Stretch/compress the clip to a fixed length. Linear interpolation is
+        # O(n); a per-clip torchaudio Resample to an arbitrary rate builds a
+        # sinc kernel sized by gcd(sr, new_sr) and dominated pipeline runtime.
         if len(clip) != TARGET_LENGTH:
-            # Convert clip to tensor for resampling
-            clip_tensor = torch.from_numpy(clip).unsqueeze(0)  # Add channel dim
-            
-            # Use torchaudio's Resample transform
-            ratio = TARGET_LENGTH / len(clip)
-            target_sr_temp = int(sr * ratio)
-            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr_temp)
-            clip_resampled = resampler(clip_tensor).squeeze(0)
-            
-            # Ensure exact target length via padding/truncation
-            if clip_resampled.shape[0] > TARGET_LENGTH:
-                clip = clip_resampled[:TARGET_LENGTH].numpy()
-            elif clip_resampled.shape[0] < TARGET_LENGTH:
-                zero_pad_length = TARGET_LENGTH - clip_resampled.shape[0]
-                clip = torch.nn.functional.pad(clip_resampled, (0, zero_pad_length)).numpy()
-            else:
-                clip = clip_resampled.numpy()
+            clip_tensor = torch.from_numpy(np.ascontiguousarray(clip, dtype=np.float32))
+            clip = torch.nn.functional.interpolate(
+                clip_tensor.view(1, 1, -1),
+                size=TARGET_LENGTH,
+                mode="linear",
+                align_corners=False,
+            ).view(-1).numpy()
 
         clips.append(clip)
         valid_onset_times.append(onset / sr)  # Convert samples to seconds

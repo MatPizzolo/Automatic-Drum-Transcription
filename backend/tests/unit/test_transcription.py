@@ -50,7 +50,8 @@ class TestBuildSheetMusicStructure:
         bpm = 140
         score = build_sheet_music([_hit()], bpm=bpm)
         assert len(score.tempos) >= 1
-        assert score.tempos[0].qpm == bpm
+        # symusic stores tempo as integer microseconds per quarter note
+        assert score.tempos[0].qpm == pytest.approx(bpm, rel=1e-4)
 
     def test_time_signature_event_added(self):
         score = build_sheet_music([_hit()], bpm=120)

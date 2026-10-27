@@ -10,12 +10,19 @@ numpy==1.26.4
 audio-separator[cpu]==0.22.0
 
 # ML Pipeline - Transformer-based Hit Detection
-torch>=2.0.0,<3.0.0
-transformers>=4.35.0
-torchaudio>=2.0.0
+# Pinned as a matching set. torch >= 2.6 defaults torch.load(weights_only=True),
+# which audio-separator 0.22 cannot load Demucs checkpoints with, and
+# torchaudio >= 2.9 needs torchcodec for torchaudio.load().
+# Dockerfiles install these three from the PyTorch CPU index first.
+torch==2.5.1
+torchaudio==2.5.1
+torchvision==0.20.1
+transformers>=4.35.0,<5
 
 # ML Pipeline - Modern Symbolic Music Processing
-symusic>=0.4.0
+symusic==0.6.0
+# MusicXML writer (symusic only writes MIDI/ABC)
+music21>=9.1,<11
 
 # YouTube Download
 yt-dlp==2024.12.23

@@ -256,7 +256,7 @@ def ingest_audio(job_id: str) -> str:
     reject_on_worker_lost=True,
 )
 def separate_drums(self, job_id: str) -> str:
-    """BS-Roformer drum separation (heavy-compute queue)."""
+    """Drum-stem separation via audio-separator (heavy-compute queue)."""
     import structlog
     logger = structlog.get_logger("task.separate_drums")
     start = time.monotonic()

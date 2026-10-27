@@ -317,16 +317,19 @@ async def create_job(
         )
         existing_job = existing.scalar_one_or_none()
         if existing_job is not None:
-            # Refresh to avoid lazy loading issues
-            await db.refresh(existing_job)
+            # Read the fields before rollback: rollback expires every loaded
+            # object, and touching an expired attribute afterwards triggers a
+            # sync lazy load (MissingGreenlet under asyncio).
+            existing_id = existing_job.id
+            existing_status = existing_job.status.value
             logger.info(
                 "duplicate_upload_returning_existing",
-                job_id=str(existing_job.id),
+                job_id=str(existing_id),
                 content_hash=content_hash[:16],
-                existing_status=existing_job.status.value,
+                existing_status=existing_status,
             )
             await db.rollback()
-            return JobCreateResponse(id=existing_job.id, status=existing_job.status.value)
+            return JobCreateResponse(id=existing_id, status=existing_status)
 
         # No duplicate — rename temp artifact dir to the real job id and persist hash
         from app.storage.backend import LocalStorageBackend, S3StorageBackend

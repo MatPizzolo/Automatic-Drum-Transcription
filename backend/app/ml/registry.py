@@ -164,8 +164,8 @@ def get_model_resolver() -> ModelResolver:
 
 def preload_separator_model() -> None:
     """
-    Preload BS-Roformer model at worker startup.
-    Downloads .ckpt file to MODEL_CACHE_DIR to prevent re-downloads during tasks.
+    Preload the separation model at worker startup.
+    Downloads its weights to MODEL_CACHE_DIR to prevent re-downloads during tasks.
     """
     from audio_separator.separator import Separator
     
@@ -179,7 +179,7 @@ def preload_separator_model() -> None:
     
     # Load model - this triggers download to cache if not present
     try:
-        temp_separator.load_model(model_filename="model_bs_roformer_ep_368_sdr_12.9628.ckpt")
+        temp_separator.load_model(model_filename=settings.SEPARATION_MODEL)
         logger.info("separator_model_preloaded", cache_dir=settings.MODEL_CACHE_DIR)
     except Exception as e:
         logger.error("separator_preload_failed", error=str(e))
@@ -197,7 +197,7 @@ def preload_models() -> None:
         _load_ast_model()
         logger.info("ast_model_preloaded")
         
-        # Preload BS-Roformer separator model
+        # Preload separation model
         preload_separator_model()
         
         logger.info("all_models_preloaded")
